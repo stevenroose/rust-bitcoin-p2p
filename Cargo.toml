@@ -1,0 +1,20 @@
+[package]
+name = "bitcoin-p2p"
+version = "0.0.0"
+authors = ["Steven Roose <steven@stevenroose.org>"]
+description = "Implementation of the Bitcoin p2p protocol."
+repository = "https://github.com/stevenroose/rust-bitcoin-p2p"
+license = "CC0-1.0"
+edition = "2018"
+
+[dependencies]
+bitcoin = "0.25.0"
+log = "0.4.8"
+rand = "0.7.2"
+
+mio = { version = "0.7.5", features = [ "tcp", "os-poll" ] }
+
+[dev-dependencies]
+fern = "0.5"
+chrono = "0.4.9"
+
