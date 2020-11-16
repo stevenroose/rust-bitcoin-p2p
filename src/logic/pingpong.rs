@@ -47,7 +47,7 @@ pub fn handle_ping(react: &mut Reactions, peer: PeerId, state: &mut PeerState, n
 pub fn handle_pong(react: &mut Reactions, peer: PeerId, state: &mut PeerState, nonce: u64) {
 	trace!("Received pong with nonce {} from peer {}", nonce, peer);
 
-	if state.handshake.pver > constants::VERSION_PONG {
+	if state.handshake.pver < constants::VERSION_PONG {
 		debug!("Peer {} sent a pong but reported non-pong PVER", peer);
 		react.disconnect(peer);
 		return;
