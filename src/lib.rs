@@ -152,14 +152,14 @@ pub struct P2P {
 impl P2P {
 	/// Instantiate a P2P coordinator.
 	pub fn new(config: Config) -> Result<Arc<P2P>, Error> {
-		let poll = mio::Poll::new()?;
-		let waker = mio::Waker::new(poll.registry(), processor::WAKE_TOKEN)?;
-
 		// Create the control message channel.
 		let (ctrl_tx, ctrl_rx) = mpsc::channel();
 
 		// Create the incoming message channel.
 		let (event_tx, event_rx) = mpsc::channel(); //TODO(stevenroose) make sync
+
+		// Create the processor thread and receive the waker.
+		let (processor, waker) = processor::Thread::new(ctrl_rx, event_tx)?;
 
 		let p2p = Arc::new(P2P {
 			config: config,
@@ -173,7 +173,9 @@ impl P2P {
 		});
 
 		let p2p_cloned = p2p.clone();
-		thread::spawn(|| processor::processor(p2p_cloned, poll, ctrl_rx, event_tx));
+		thread::Builder::new()
+			.name("bitcoin_p2p_thread".into())
+			.spawn(|| processor.run(p2p_cloned))?;
 
 		Ok(p2p)
 	}
@@ -228,10 +230,11 @@ impl P2P {
 		if let Some(err) = conn.take_error()? {
 			return Err(Error::PeerUnreachable(err));
 		}
+		let addr = conn.peer_addr()?;
 
 		let id = self.next_peer_id();
 		let mut state = PeerState {
-			addr: conn.peer_addr()?,
+			addr: addr,
 			local_addr: conn.local_addr()?,
 			peer_type: peer_type,
 			send_headers: false,
@@ -248,7 +251,7 @@ impl P2P {
 
 		// If this errors, it means that shutdown was called between our check
 		// of ensure_up and now.
-		let _ = self.ctrl_tx.lock().unwrap().send(Ctrl::Connect(id, conn));
+		let _ = self.ctrl_tx.lock().unwrap().send(Ctrl::Connect(id, addr, conn));
 
 		// Then send the version message to start the handshake.
 		self.send_control(Ctrl::SendMsg(id, NetworkMessage::Version(version)));

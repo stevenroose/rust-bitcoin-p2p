@@ -77,8 +77,8 @@ impl Scheduler {
 		macro_rules! get_state {
 			($peer:expr) => {{
 				peers_lock = Some(p2p.peers.lock().unwrap());
-				or_continue!(peers_lock.as_mut().unwrap().get_mut($peer))
-				}};
+				or!(peers_lock.as_mut().unwrap().get_mut($peer), continue)
+			}};
 		}
 
 		loop {

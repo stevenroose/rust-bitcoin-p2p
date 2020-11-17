@@ -14,12 +14,11 @@ pub fn poisson_duration(avg: Duration) -> Duration {
 	Duration::from_secs(poisson_u64(avg.as_secs()))
 }
 
-/// Get the value and call `continue` when it's [None];
-macro_rules! or_continue {
-	($opt:expr) => {
+macro_rules! or {
+	($opt:expr, $other:tt) => {
 		match $opt {
 			Some(v) => v,
-			None => continue,
+			None => $other,
 		}
 	};
 }
