@@ -2,19 +2,21 @@
 use std::{io, ptr, net};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read, Write};
-use std::sync::{atomic, mpsc, Arc};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 use bitcoin::consensus::encode::{self, Decodable, Encodable};
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 
+use crate::{Event, Listener, PeerId, P2P};
 use crate::logic::{self, Reactions, Scheduler};
-use crate::{P2PEvent, PeerId, P2P};
 
-pub const WAKE_TOKEN: mio::Token = mio::Token(0);
+const WAKE_TOKEN: mio::Token = mio::Token(0);
 
 /// Control message used to communicate with the processor thread.
 pub enum Ctrl {
+	/// Add a new listener.
+	AddListener(Box<dyn Listener>),
 	/// Add a new peer.
 	Connect(PeerId, net::SocketAddr, mio::net::TcpStream),
 	/// Disconnect the peer.
@@ -23,6 +25,8 @@ pub enum Ctrl {
 	SendMsg(PeerId, NetworkMessage),
 	/// Broadcast the message to all peers.
 	BroadcastMsg(NetworkMessage),
+	/// Order the processor thread to shutdown.
+	Shutdown,
 }
 
 /// I/O related state for a peer.
@@ -139,15 +143,8 @@ pub struct Thread {
 	/// A reference to the p2p struct.
 	p2p: Arc<P2P>,
 
-	/// Our view on the peers.
-	peers: HashMap<PeerId, PeerIo>,
-
 	/// The I/O poll that wakes us up when things happen.
 	poll: mio::Poll,
-	/// This is our main I/O buffer. It's re-used for all TCP I/O.
-	/// This buffer will in practice grow to the size of the OS-level buffer
-	/// for TCP streams.
-	buffer: Vec<u8>,
 
 	/// The channel on which we receive control messages.
 	ctrl_rx: mpsc::Receiver<Ctrl>,
@@ -159,15 +156,12 @@ pub struct Thread {
 	/// an iteration of the main loop.
 	react: Reactions,
 
-	/// The channel on which we send outgoing events.
-	event_tx: mpsc::Sender<P2PEvent>,
+	/// The listeners to dispatch events to.
+	listeners: Vec<Box<dyn Listener>>,
 }
 
 impl Thread {
-	pub fn new(
-		ctrl_rx: mpsc::Receiver<Ctrl>,
-		event_tx: mpsc::Sender<P2PEvent>,
-	) -> Result<(Thread, mio::Waker), io::Error> {
+	pub fn new(ctrl_rx: mpsc::Receiver<Ctrl>) -> Result<(Thread, mio::Waker), io::Error> {
 		let poll = mio::Poll::new()?;
 		let waker = mio::Waker::new(poll.registry(), WAKE_TOKEN)?;
 
@@ -175,28 +169,108 @@ impl Thread {
 			// This is quite ugly, but because we have a circular dependency,
 			// we can only get this Arc in the [run] method below.
 			p2p: unsafe { Arc::from_raw(ptr::null()) },
-			peers: HashMap::new(),
 			poll: poll,
-			buffer: Vec::with_capacity(bitcoin::consensus::encode::MAX_VEC_SIZE),
 			ctrl_rx: ctrl_rx,
 			scheduler: Scheduler::new(),
 			react: Reactions::new(),
-			event_tx: event_tx,
+			listeners: Vec::new(),
 		};
 		Ok((thread, waker))
 	}
 
+	/// Dispatch this event al all listeners.
+	fn dispatch(&mut self, event: Event) {
+		// We iterate backwards over the listeners so that we can efficiently
+		// remove them if needed.
+		for i in (0..self.listeners.len()).rev() {
+			if !self.listeners.get_mut(i).unwrap().event(&event) {
+				debug!("Some listener was disconnected, so we remove it");
+				// This removes the item and replaces it with the last one, so we
+				// can continue iterating backwards without having to mess with
+				// iterators
+				self.listeners.swap_remove(i);
+			}
+		}
+	}
+
+	/// Handle an incoming message.
+	///
+	/// Some messages are handled internally, those that are not are pushed into
+	/// the channel.
+	pub fn handle_message(&mut self, peer: PeerId, msg: NetworkMessage) {
+		debug!("Received {:?} message from {}", msg.cmd(), peer);
+
+		if let NetworkMessage::Version(ver) = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			logic::handshake::handle_version(&mut self.react, &self.p2p, peer, state, ver);
+			if state.handshake.finished() {
+				drop(state);
+				drop(peers_lock);
+				self.dispatch(Event::Connected(peer));
+			}
+			return;
+		}
+
+		if let NetworkMessage::Verack = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			// Store verack info and schedule first ping.
+			logic::handshake::handle_verack(&mut self.react, &self.p2p.config, peer, state);
+			if state.handshake.finished() {
+				drop(state);
+				drop(peers_lock);
+				self.dispatch(Event::Connected(peer));
+			}
+			return;
+		}
+
+		if let NetworkMessage::Ping(nonce) = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			logic::pingpong::handle_ping(&mut self.react, peer, state, nonce);
+			return;
+		}
+
+		if let NetworkMessage::Pong(nonce) = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			logic::pingpong::handle_pong(&mut self.react, peer, state, nonce);
+			return;
+		}
+
+		if let NetworkMessage::SendHeaders = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			state.send_headers = true;
+			return;
+		}
+
+		if let NetworkMessage::Inv(ref items) = msg {
+			let mut peers_lock = self.p2p.peers.lock().unwrap();
+			let state = or!(peers_lock.get_mut(&peer), return);
+			logic::inventory::handle_inv(state, items);
+			// don't return but pass the message to the user
+		}
+
+		self.dispatch(Event::Message(peer, msg));
+	}
+
 	/// Read new messages for this peer from his TCP stream.
-	fn handle_read(&mut self, peer: PeerId) -> Result<(), ReadError> {
-		let pio = or!(self.peers.get_mut(&peer), {return Ok(())});
-		trace!("buffer: len={}; cap={}", self.buffer.len(), self.buffer.capacity());
-		self.buffer.clear(); // Set the len to 0.
+	fn handle_read(
+		&mut self,
+		peer: PeerId,
+		pio: &mut PeerIo,
+		buffer: &mut Vec<u8>,
+	) -> Result<(), ReadError> {
+		trace!("buffer: len={}; cap={}", buffer.len(), buffer.capacity());
+		buffer.clear(); // Set the len to 0.
 
 		// First check if we have some leftover of the last read.
 		let peer_buf = &mut pio.buf_in;
 		let had_peer_buf = !peer_buf.is_empty();
-		if !peer_buf.is_empty() {
-			self.buffer.write_all(&peer_buf).expect("vecs don't error");
+		if had_peer_buf {
+			buffer.write_all(&peer_buf).expect("vecs don't error");
 			peer_buf.clear();
 		}
 
@@ -204,7 +278,7 @@ impl Thread {
 		// the buffer being freed when the cursor goes out of scope when the
 		// 'parsing loop breaks.
 		//TODO(stevenroose) try to clean that up!
-		let mut cursor = Cursor::new(&mut self.buffer);
+		let mut cursor = Cursor::new(buffer);
 
 		'reading:
 		loop {
@@ -283,13 +357,7 @@ impl Thread {
 				}
 
 				trace!("Queueing {} msg for peer {}", raw_msg.cmd(), peer);
-				logic::handle_message(
-					&self.p2p,
-					&mut self.react,
-					&self.event_tx,
-					peer,
-					raw_msg.payload,
-				);
+				self.handle_message(peer, raw_msg.payload);
 
 				// Check if we reached the end of our buffer.
 				if cursor.position() as usize == cursor.get_ref().len() {
@@ -316,7 +384,12 @@ impl Thread {
 	}
 
 	/// Conncet to the given peer.
-	fn connect_peer(&mut self, id: PeerId, addr: net::SocketAddr, mut conn: mio::net::TcpStream) {
+	fn connect_peer(
+		&mut self,
+		id: PeerId,
+		addr: net::SocketAddr,
+		mut conn: mio::net::TcpStream,
+	) -> PeerIo {
 		debug!("Handling Ctrl::Connect {}: {}", id, addr);
 
 		// Register the TCP stream in our Poll.
@@ -324,28 +397,27 @@ impl Thread {
 		self.poll.registry().register(&mut conn, mio::Token(id.0), interest)
 			.expect("TCP stream poll registry failed");
 
-		let pio = PeerIo {
+		PeerIo {
 			addr: addr,
 			conn: conn,
 			buf_in: Vec::new(),
 			buf_out: Vec::new(),
 			queue_out: VecDeque::with_capacity(self.p2p.config.max_msg_queue_size),
-		};
-		assert!(self.peers.insert(id, pio).is_none(), "duplicate peer id: {}", id);
+		}
 	}
 
 	/// A method to safely disconnect a peer.
 	/// This will also remove the peer from the P2P map and notify the [done]
 	/// condvar before releasing the P2P peers lock.
-	fn disconnect_peer<'a>(&mut self, peer: PeerId) {
-		if let Some(pio) = self.peers.remove(&peer) {
+	fn disconnect_peer<'a>(&mut self, peer: PeerId, pio: Option<PeerIo>) {
+		if let Some(pio) = pio {
 			info!("Disconnecting peer {} with address {}", peer, pio.addr);
 			if let Err(e) = pio.conn.shutdown(net::Shutdown::Both) {
 				debug!("Error shutting down connection with {}: {}", pio.addr, e);
 			}
 
 			self.p2p.peers.lock().unwrap().remove(&peer).expect("peer must exist");
-			self.event_tx.send(P2PEvent::Disconnected(peer)).expect("event channel broken");
+			self.dispatch(Event::Disconnected(peer));
 			info!("Succesfully disconnected peer {} with address {}", peer, pio.addr);
 		} else {
 			warn!("Already disconnected peer {}", peer);
@@ -353,8 +425,7 @@ impl Thread {
 	}
 
 	/// Try queue the message to the peer and try send it over TCP if possible.
-	fn queue_msg(&mut self, peer: PeerId, msg: NetworkMessage) {
-		let pio = or!(self.peers.get_mut(&peer), return);
+	fn queue_msg(&mut self, peer: PeerId, pio: &mut PeerIo, msg: NetworkMessage) {
 		if pio.queue_out.len() >= self.p2p.config.max_msg_queue_size {
 			debug!("Dropping {} message to peer {} ({}): full queue", msg.cmd(), peer, pio.addr);
 			return;
@@ -386,9 +457,19 @@ impl Thread {
 
 	/// Run the thread.
 	pub fn run(mut self, p2p: Arc<P2P>) {
+		info!("P2P processor thread starting...");
 		self.p2p = p2p;
-		trace!("processor starting...");
+
+		// To capture poll events.
 		let mut events = mio::Events::with_capacity(1024);
+
+		// This is our main I/O buffer. It's re-used for all TCP I/O.
+		// This buffer will in practice grow to the size of the OS-level buffer
+		// for TCP streams.
+		let mut buffer = Vec::with_capacity(bitcoin::consensus::encode::MAX_VEC_SIZE);
+
+
+		let mut peers = HashMap::new();
 
 		loop {
 			events.clear();
@@ -399,66 +480,74 @@ impl Thread {
 			self.poll.poll(&mut events, timeout).expect("poll error");
 			trace!("processor woken up");
 
-			if self.p2p.quit.load(atomic::Ordering::Relaxed) {
-				info!("P2P processing thread received quit signal; exiting.");
-				return;
-			}
-
 			// First handle control messages so that we can disconnect peers early
 			// and create peers that might already have messages queued.
 			while let Ok(ctrl) = self.ctrl_rx.try_recv() {
 				match ctrl {
-					Ctrl::Connect(id, addr, conn) => self.connect_peer(id, addr, conn),
+					Ctrl::AddListener(listener) => self.listeners.push(listener),
 
-					Ctrl::Disconnect(peer) => self.disconnect_peer(peer),
+					Ctrl::Connect(id, addr, conn) => {
+						let pio = self.connect_peer(id, addr, conn);
+						assert!(peers.insert(id, pio).is_none(), "duplicate peer id: {}", id);
+					}
+
+					Ctrl::Disconnect(peer) => self.disconnect_peer(peer, peers.remove(&peer)),
 
 					Ctrl::SendMsg(peer, msg) => {
-						self.queue_msg(peer, msg);
+						let pio = or!(peers.get_mut(&peer), continue);
+						self.queue_msg(peer, pio, msg);
 					}
 
 					Ctrl::BroadcastMsg(msg) => {
-						for peer in self.peers.keys().copied().collect::<Vec<_>>() {
-							self.queue_msg(peer, msg.clone());
+						for (peer, pio) in peers.iter_mut() {
+							self.queue_msg(*peer, pio, msg.clone());
 						}
+					}
+
+					Ctrl::Shutdown => {
+						info!("Processor thread received shutdown signal; shutting down...");
+						//TODO(stevenroose) should we close all tcp connections?
+						return;
 					}
 				}
 			}
 
 			// In between, disconnect missing peers.
 			for peer in self.react.take_disconnects() {
-				self.disconnect_peer(peer);
+				self.disconnect_peer(peer, peers.remove(&peer));
 			}
 
 			// Then perform all I/O events for reading.
 			for event in events.iter().filter(|e| e.is_readable() && e.token() != WAKE_TOKEN) {
 				let peer = PeerId(event.token().0);
+				let pio = or!(peers.get_mut(&peer), continue);
 
 				trace!("Readable event for peer {}", peer);
-				if let Err(err) = self.handle_read(peer) {
-					let addr = self.peers.get(&peer).unwrap().addr;
+				if let Err(err) = self.handle_read(peer, pio, &mut buffer) {
+					let addr = peers[&peer].addr;
 					match err {
 						ReadError::Disconnected => {
 							info!("Peer {} ({}) disconnected.", peer, addr);
-							self.disconnect_peer(peer);
+							self.disconnect_peer(peer, peers.remove(&peer));
 						}
 						ReadError::DoS(e) => {
 							warn!("DoS error from peer {} ({}): {}", peer, addr, e);
 							//TODO(stevenroose) should ban
-							self.disconnect_peer(peer);
+							self.disconnect_peer(peer, peers.remove(&peer));
 						}
 						ReadError::Encode(e) => {
 							warn!("Encoding error from peer {} ({}): {}", peer, addr, e);
 							//TODO(stevenroose) should ban
-							self.disconnect_peer(peer);
+							self.disconnect_peer(peer, peers.remove(&peer));
 						}
 						ReadError::WrongMagic(m) => {
 							warn!("Peer {} ({}) uses bad network magic: 0x{:08x}", peer, addr, m);
 							//TODO(stevenroose) should ban
-							self.disconnect_peer(peer);
+							self.disconnect_peer(peer, peers.remove(&peer));
 						}
 						ReadError::Tcp(e) => {
 							warn!("Error reading from peer {} ({}): {}", peer, addr, e);
-							self.disconnect_peer(peer);
+							self.disconnect_peer(peer, peers.remove(&peer));
 						}
 					}
 				}
@@ -466,20 +555,20 @@ impl Thread {
 
 			// In between reading and writing, disconnect misbehaving peers.
 			for peer in self.react.take_disconnects() {
-				self.disconnect_peer(peer);
+				self.disconnect_peer(peer, peers.remove(&peer));
 			}
 
 			// Then perform all I/O events for writing.
 			for event in events.iter().filter(|e| e.is_readable() && e.token() != WAKE_TOKEN) {
 				let peer = PeerId(event.token().0);
-				let pio = or!(self.peers.get_mut(&peer), continue);
+				let pio = or!(peers.get_mut(&peer), continue);
 				trace!("Writable event for peer {} ({})", peer, pio.addr);
 
 				if let Err(e) = handle_write(peer, pio, self.p2p.config.network.magic()) {
 					let addr = pio.addr;
 
 					warn!("Error writing to peer {} ({}): {}", peer, addr, e);
-					self.disconnect_peer(peer);
+					self.disconnect_peer(peer, peers.remove(&peer));
 					continue;
 				}
 
@@ -500,13 +589,14 @@ impl Thread {
 
 			// Also disconnect bad peers.
 			for peer in self.react.take_disconnects() {
-				self.disconnect_peer(peer);
+				self.disconnect_peer(peer, peers.remove(&peer));
 			}
 
 			// Then queue new outgoing messages.
 			trace!("Scheduler and handler queued {} messages", self.react.len());
 			for (peer, msg) in self.react.drain_messages() {
-				self.queue_msg(peer, msg);
+				let pio = or!(peers.get_mut(&peer), continue);
+				self.queue_msg(peer, pio, msg);
 			}
 
 			assert_eq!(self.react.len(), 0, "the action queue should be empty!");

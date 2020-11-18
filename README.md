@@ -24,5 +24,5 @@ This is a Rust library implementation of the Bitcoin p2p protocol.
 - addrv2 https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki
   https://github.com/rust-bitcoin/rust-bitcoin/pull/449
 - block filters
-
+- support WASM-threads with compile flags
 
