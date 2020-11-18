@@ -1,11 +1,9 @@
 #[macro_use]
 extern crate log;
 
-use std::thread;
 use std::time::Duration;
 
 use bitcoin::network::constants::ServiceFlags;
-use bitcoin::network::message::NetworkMessage;
 use bitcoin_p2p::*;
 
 fn setup_logger() {
@@ -37,10 +35,10 @@ fn main() {
 	}).unwrap();
 
 	let conn1 = mio::net::TcpStream::connect("127.0.0.1:18444".parse().unwrap()).unwrap();
-	let _p1 = p2p.add_peer(conn1, PeerType::Outbound, 0).expect("adding peer");
+	let _p1 = p2p.add_peer(conn1, PeerType::Outbound).expect("adding peer");
 
-	let chan = p2p.take_event_channel().unwrap();
-	for event in chan.iter() {
+	let receiver = p2p.create_listener_channel();
+	for event in receiver.iter() {
 		info!("Received event: {:?}", event);
 	}
 }

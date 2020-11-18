@@ -7,12 +7,12 @@ pub mod pingpong;
 
 use std::{cmp, mem};
 use std::collections::BinaryHeap;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::network::message::NetworkMessage;
 
-use crate::{P2PEvent, PeerId, P2P};
+use crate::{PeerId, P2P};
 
 /// The time to run ahead of schedule. This avoids accidentally
 /// report wake-up calls in the past.
@@ -187,76 +187,4 @@ impl Reactions {
 			_ => None,
 		})
 	}
-}
-
-/// Handle an incoming message.
-///
-/// Some messages are handled internally, those that are not are pushed into
-/// the channel.
-pub fn handle_message(
-	p2p: &Arc<P2P>,
-	react: &mut Reactions,
-	event_tx: &mpsc::Sender<P2PEvent>,
-	peer: PeerId,
-	msg: NetworkMessage,
-) {
-	debug!("Received {:?} message from {}", msg.cmd(), peer);
-
-	// Keep the state lock, but load it lazily, only when it's needed.
-	#[allow(unused)] //TODO(stevenroose) cargo complains about this
-	let mut peers_lock = None;
-	macro_rules! get_state {
-		() => {{
-			peers_lock = Some(p2p.peers.lock().unwrap());
-			match peers_lock.as_mut().unwrap().get_mut(&peer) {
-				None => return,
-				Some(s) => s,
-				}
-			}};
-	}
-
-	if let NetworkMessage::Version(ver) = msg {
-		let state = get_state!();
-		handshake::handle_version(react, &p2p, peer, state, ver);
-		if state.handshake.finished() {
-			event_tx.send(P2PEvent::Connected(peer)).expect("event channel broken");
-		}
-		return;
-	}
-
-	if let NetworkMessage::Verack = msg {
-		let state = get_state!();
-		// Store verack info and schedule first ping.
-		handshake::handle_verack(react, &p2p.config, peer, state);
-		if state.handshake.finished() {
-			event_tx.send(P2PEvent::Connected(peer)).expect("event channel broken");
-		}
-		return;
-	}
-
-	if let NetworkMessage::Ping(nonce) = msg {
-		let state = get_state!();
-		pingpong::handle_ping(react, peer, state, nonce);
-		return;
-	}
-
-	if let NetworkMessage::Pong(nonce) = msg {
-		let state = get_state!();
-		pingpong::handle_pong(react, peer, state, nonce);
-		return;
-	}
-
-	if let NetworkMessage::SendHeaders = msg {
-		let state = get_state!();
-		state.send_headers = true;
-		return;
-	}
-
-	if let NetworkMessage::Inv(ref items) = msg {
-		let state = get_state!();
-		inventory::handle_inv(state, items);
-		// don't return but pass the message to the user
-	}
-
-	event_tx.send(P2PEvent::Message(peer, msg)).expect("event channel broken");
 }

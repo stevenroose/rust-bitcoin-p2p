@@ -3,17 +3,20 @@
 #[macro_use]
 extern crate log;
 
-pub mod constants;
 #[macro_use]
 mod utils;
 
+pub mod constants;
+
 mod config;
+mod error;
 mod logic;
 mod processor;
 
 pub use config::Config;
+pub use error::Error;
 
-use std::{fmt, io, net, thread};
+use std::{fmt, net, thread};
 use std::collections::HashMap;
 use std::sync::{atomic, mpsc, Arc, Mutex};
 
@@ -22,39 +25,53 @@ use bitcoin::network::message_blockdata::Inventory;
 use bitcoin::network::message_network::VersionMessage;
 
 use processor::Ctrl;
+use utils::WakerSender;
 
-#[derive(Debug)]
-pub enum Error {
-	/// No peer with given ID known. He must have been disconnected.
-	PeerDisconnected(PeerId),
-	/// We have already shut down.
-	Shutdown,
-	/// An I/O error.
-	Io(io::Error),
-	/// Can't reach the peer.
-	PeerUnreachable(io::Error),
-	/// The handshake with the peer is not finished.
-	PeerHandshakePending,
+
+/// Trait used to listen to events.
+///
+/// The following types implement this trait:
+/// - [std::sync::mpsc::Sender<Event>]
+/// - [std::sync::mpsc::SyncSender<Event>] (dropping events when full)
+// /// - [Fn(&Event) -> bool]
+pub trait Listener: Send {
+	/// Handle a new incoming event.
+	///
+	/// Should return false if the listener should be removed, true otherwise.
+	///
+	/// It's very important that the execution of this method is fast and
+	/// certainly never blocks the thread. That's why it's probably advised to
+	/// not implement this trait on your actual handler but on a channel to
+	/// queue the events or an async function.
+	fn event(&mut self, event: &Event) -> bool;
 }
 
-impl From<io::Error> for Error {
-	fn from(e: io::Error) -> Error {
-		Error::Io(e)
+impl Listener for mpsc::Sender<Event> {
+	fn event(&mut self, event: &Event) -> bool {
+		self.send(event.clone()).is_ok()
 	}
 }
 
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match *self {
-			Error::PeerDisconnected(id) => write!(f, "peer disconnected: {}", id),
-			Error::Shutdown => write!(f, "P2P is already shut down"),
-			Error::Io(ref e) => write!(f, "I/O error: {}", e),
-			Error::PeerUnreachable(ref e) => write!(f, "can't reach the peer: {}", e),
-			Error::PeerHandshakePending => write!(f, "peer didn't finish the handshake yet"),
+impl Listener for mpsc::SyncSender<Event> {
+	fn event(&mut self, event: &Event) -> bool {
+		match self.try_send(event.clone()) {
+			Ok(()) => true,
+			Err(mpsc::TrySendError::Full(e)) => {
+				warn!("Sync channel event listener full; dropping event: {:?}", e);
+				true
+			}
+			Err(mpsc::TrySendError::Disconnected(_)) => false,
 		}
 	}
 }
-impl std::error::Error for Error {}
+
+// pub type EventHandler = FnMut(&Event) -> bool;
+
+// impl Listener for EventHandler {
+// 	fn event(&mut self, event: &Event) -> bool {
+// 		self(event)
+// 	}
+// }
 
 /// A peer identifier.
 ///
@@ -68,9 +85,9 @@ impl fmt::Display for PeerId {
 	}
 }
 
-/// A signal received from a peer.
+/// A signal received from P2P about a peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum P2PEvent {
+pub enum Event {
 	/// The new peer connected, performed the handshake and can be
 	/// communicated with.
 	Connected(PeerId),
@@ -78,6 +95,17 @@ pub enum P2PEvent {
 	Disconnected(PeerId),
 	/// The peer sent a message.
 	Message(PeerId, NetworkMessage),
+}
+
+impl Event {
+	/// The peer this event is about.
+	pub fn peer(&self) -> PeerId {
+		match self {
+			Event::Connected(p) => *p,
+			Event::Disconnected(p) => *p,
+			Event::Message(p, _) => *p,
+		}
+	}
 }
 
 /// Whether a peer was inbound or outbound.
@@ -134,19 +162,10 @@ pub struct P2P {
 	peers: Mutex<HashMap<PeerId, PeerState>>,
 
 	/// Handle to send control messages to the processor thread.
-	ctrl_tx: Mutex<mpsc::Sender<Ctrl>>,
-	/// Waker to wake up the processor thread.
-	waker: mio::Waker,
-
-	/// The incoming event channel.
-	/// It's an Option so that the user can take it away.
-	event_rx: Mutex<Option<mpsc::Receiver<P2PEvent>>>,
+	ctrl_tx: Mutex<WakerSender<Ctrl>>,
 
 	/// The current block height of our client to advertise to peers.
 	block_height: atomic::AtomicU32,
-
-	/// A global signal for our thread to shut down.
-	quit: atomic::AtomicBool,
 }
 
 impl P2P {
@@ -155,21 +174,16 @@ impl P2P {
 		// Create the control message channel.
 		let (ctrl_tx, ctrl_rx) = mpsc::channel();
 
-		// Create the incoming message channel.
-		let (event_tx, event_rx) = mpsc::channel(); //TODO(stevenroose) make sync
-
 		// Create the processor thread and receive the waker.
-		let (processor, waker) = processor::Thread::new(ctrl_rx, event_tx)?;
+		let (processor, waker) = processor::Thread::new(ctrl_rx)?;
+		let ctrl_tx = WakerSender::new(ctrl_tx, waker);
 
 		let p2p = Arc::new(P2P {
 			config: config,
 			next_peer_id: atomic::AtomicUsize::new(1),
 			peers: Mutex::new(HashMap::new()),
 			ctrl_tx: Mutex::new(ctrl_tx),
-			waker: waker,
-			event_rx: Mutex::new(Some(event_rx)),
 			block_height: atomic::AtomicU32::new(0),
-			quit: atomic::AtomicBool::new(false),
 		});
 
 		let p2p_cloned = p2p.clone();
@@ -195,15 +209,6 @@ impl P2P {
 		PeerId(self.next_peer_id.fetch_add(1, atomic::Ordering::Relaxed))
 	}
 
-	/// Ensure we are still running, returning an error otherwise.
-	fn ensure_up(&self) -> Result<(), Error> {
-		if self.quit.load(atomic::Ordering::Relaxed) {
-			Err(Error::Shutdown)
-		} else {
-			Ok(())
-		}
-	}
-
 	/// Check if the peer is known, returning an error if it doesn't.
 	fn ensure_known_peer(&self, peer: PeerId) -> Result<(), Error> {
 		if !self.peers.lock().unwrap().contains_key(&peer) {
@@ -213,10 +218,14 @@ impl P2P {
 		}
 	}
 
+	/// Queue a new control message to the processor thread.
+	fn send_ctrl(&self, ctrl: Ctrl) -> Result<(), Error> {
+		self.ctrl_tx.lock().unwrap().send(ctrl).map_err(|_| Error::Shutdown)
+	}
+
 	/// Shut down the p2p operation. Any subsequent call will be a no-op.
-	pub fn shutdown(&self) {
-		self.quit.store(true, atomic::Ordering::Relaxed);
-		let _ = self.waker.wake(); //TODO(stevenroose) log error?
+	pub fn shutdown(&self) -> Result<(), Error> {
+		self.send_ctrl(Ctrl::Shutdown).map_err(|_| Error::Shutdown)
 	}
 
 	/// Add a new peer from an opened TCP stream.
@@ -225,7 +234,6 @@ impl P2P {
 		conn: S,
 		peer_type: PeerType,
 	) -> Result<PeerId, Error> {
-		self.ensure_up()?;
 		let conn = conn.into_mio_tcp_stream();
 		if let Some(err) = conn.take_error()? {
 			return Err(Error::PeerUnreachable(err));
@@ -249,12 +257,8 @@ impl P2P {
 		state.handshake.version_sent = true;
 		assert!(self.peers.lock().unwrap().insert(id, state).is_none());
 
-		// If this errors, it means that shutdown was called between our check
-		// of ensure_up and now.
-		let _ = self.ctrl_tx.lock().unwrap().send(Ctrl::Connect(id, addr, conn));
-
-		// Then send the version message to start the handshake.
-		self.send_control(Ctrl::SendMsg(id, NetworkMessage::Version(version)));
+		self.send_ctrl(Ctrl::Connect(id, addr, conn))?;
+		self.send_ctrl(Ctrl::SendMsg(id, NetworkMessage::Version(version)))?;
 
 		Ok(id)
 	}
@@ -267,11 +271,9 @@ impl P2P {
 
 	/// Disconnect the given peer.
 	pub fn disconnect_peer(&self, peer: PeerId) -> Result<(), Error> {
-		self.ensure_up()?;
 		self.ensure_known_peer(peer)?;
 
-		let _ = self.ctrl_tx.lock().unwrap().send(Ctrl::Disconnect(peer));
-		Ok(())
+		self.send_ctrl(Ctrl::Disconnect(peer))
 	}
 
 	/// Disconnect the peer and don't reconnect to it.
@@ -294,21 +296,8 @@ impl P2P {
 		}
 	}
 
-	/// Take the incoming event channel out of the P2P struct.
-	/// This can be done only once.
-	pub fn take_event_channel(&self) -> Option<mpsc::Receiver<P2PEvent>> {
-		self.event_rx.lock().unwrap().take()
-	}
-
-	/// Queue a new control message to the processor thread.
-	fn send_control(&self, ctrl: Ctrl) {
-		self.ctrl_tx.lock().unwrap().send(ctrl).expect("processor quit");
-		self.waker.wake().expect("processor waker error");
-	}
-
 	/// Send a message to the given peer.
 	pub fn send_message(&self, peer: PeerId, msg: NetworkMessage) -> Result<(), Error> {
-		self.ensure_up()?;
 		let peers_lock = self.peers.lock().unwrap();
 		let state = match peers_lock.get(&peer) {
 			Some(s) => s,
@@ -319,15 +308,12 @@ impl P2P {
 			return Err(Error::PeerHandshakePending);
 		}
 
-		self.send_control(Ctrl::SendMsg(peer, msg));
-		Ok(())
+		self.send_ctrl(Ctrl::SendMsg(peer, msg))
 	}
 
 	/// Broadcast the message to all peers.
 	pub fn broadcast_message(&self, msg: NetworkMessage) -> Result<(), Error> {
-		self.ensure_up()?;
-		self.send_control(Ctrl::BroadcastMsg(msg));
-		Ok(())
+		self.send_ctrl(Ctrl::BroadcastMsg(msg))
 	}
 
 	/// Add an inventory item to send to the peer.
@@ -337,7 +323,6 @@ impl P2P {
 	/// Don't use this to send `inv` messages directly, f.e. when replying to `mempool`.
 	/// Just use `send_message` for that.
 	pub fn queue_inventory(&self, peer: PeerId, inv: Inventory) -> Result<(), Error> {
-		self.ensure_up()?;
 		let mut peers_lock = self.peers.lock().unwrap();
 		let state = match peers_lock.get_mut(&peer) {
 			Some(s) => s,
@@ -349,7 +334,7 @@ impl P2P {
 		}
 
 		if let Some(msg) = logic::inventory::queue_inventory(state, inv) {
-			self.send_control(Ctrl::SendMsg(peer, msg));
+			self.send_ctrl(Ctrl::SendMsg(peer, msg))?;
 		}
 		Ok(())
 	}
@@ -359,15 +344,34 @@ impl P2P {
 	///
 	/// Blocks are not queued up, but sent immediatelly.
 	pub fn broadcast_inventory(&self, inv: Inventory) -> Result<(), Error> {
-		self.ensure_up()?;
-
 		//TODO(stevenroose) consider doing this in the processor instead
 		for (peer, state) in self.peers.lock().unwrap().iter_mut() {
 			if let Some(msg) = logic::inventory::queue_inventory(state, inv) {
-				self.send_control(Ctrl::SendMsg(*peer, msg));
+				self.send_ctrl(Ctrl::SendMsg(*peer, msg))?;
 			}
 		}
 
 		Ok(())
+	}
+
+	/// Add a new listener.
+	///
+	/// See the documentation on the [Listener] trait to see what common
+	/// types implement this trait.
+	///
+	/// If you simply want to get an [std::mpsc::Receiver] for all events, use
+	/// [create_listener_channel].
+	pub fn add_listener<L: Listener + 'static>(&self, listener: L) -> Result<(), Error> {
+		self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
+	}
+
+	/// Create a new [std::mpsc::channel] and register it as a listener.
+	///
+	/// Note that this channel is unbounded so failure to read its content
+	/// causes increased memory usage.
+	pub fn create_listener_channel(&self) -> Result<mpsc::Receiver<Event>, Error> {
+		let (tx, rx) = mpsc::channel();
+		self.add_listener(tx)?;
+		Ok(rx)
 	}
 }
