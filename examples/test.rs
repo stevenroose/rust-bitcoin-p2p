@@ -24,6 +24,8 @@ fn setup_logger() {
 		.expect("logger");
 }
 
+
+
 fn main() {
 	setup_logger();
 
@@ -37,8 +39,25 @@ fn main() {
 	let conn1 = mio::net::TcpStream::connect("127.0.0.1:18444".parse().unwrap()).unwrap();
 	let _p1 = p2p.add_peer(conn1, PeerType::Outbound).expect("adding peer");
 
-	let receiver = p2p.create_listener_channel();
+	// Add logger.
+	// fn log_event(event: &Event) -> bool {
+	// 	trace!("New event received: {:?}", event);
+	// 	true
+	// }
+	let log_event: Box<dyn for<'e> FnMut(&'e Event) -> bool + Send> = Box::new(|event: &Event| {
+		trace!("New event received: {:?}", event);
+		true
+	});
+	p2p.add_listener(log_event).unwrap();
+
+	let receiver = p2p.create_listener_channel().unwrap();
 	for event in receiver.iter() {
-		info!("Received event: {:?}", event);
+		if let Event::Connected(peer) = event {
+			info!("Peer {} connected!", peer);
+		}
+
+		if let Event::Message(peer, msg) = event {
+			debug!("Received {} message from {}", msg.cmd(), peer);
+		}
 	}
 }
