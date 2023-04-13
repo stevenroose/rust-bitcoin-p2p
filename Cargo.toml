@@ -8,7 +8,7 @@ license = "CC0-1.0"
 edition = "2018"
 
 [dependencies]
-bitcoin = "0.25.0"
+bitcoin = "0.30.0"
 log = "0.4.8"
 rand = "0.7.2"
 rand_distr = "0.3.0"

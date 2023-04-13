@@ -33,6 +33,8 @@ use utils::WakerSender;
 /// The following types implement this trait:
 /// - [std::sync::mpsc::Sender<Event>]
 /// - [std::sync::mpsc::SyncSender<Event>] (dropping events when full)
+/// - [dyn for <'e> FnMut(&'e Event) -> bool + Send], a closure or function taking an Event,
+///   returning false when the listener should be removed.
 pub trait Listener: Send + 'static {
 	/// Handle a new incoming event.
 	///
@@ -64,16 +66,7 @@ impl Listener for mpsc::SyncSender<Event> {
 	}
 }
 
-/// A function that handles an event. A function with this signature can be
-/// registered as an event [Listener].
-///
-/// Should return false if the listener should be removed, true otherwise.
-///
-/// Be careful when using these as without any access to what happens inside
-/// the function, this listener will live forever and can't be removed.
-pub type EventHandler = Box<dyn for <'e> FnMut(&'e Event) -> bool + Send>;
-
-impl Listener for EventHandler {
+impl<F: for<'e> FnMut(&'e Event) -> bool + Send + 'static> Listener for F {
 	fn event(&mut self, event: &Event) -> bool {
 		self(event)
 	}
@@ -370,6 +363,9 @@ impl P2P {
 	pub fn add_listener(&self, listener: impl Listener) -> Result<(), Error> {
 		self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
 	}
+	// pub fn add_listener_function(&self, listener: impl for<'e> FnMut(&'e Event) -> bool + Send + 'static) -> Result<(), Error> {
+	// 	self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
+	// }
 
 	/// Create a new [std::mpsc::channel] and register it as a listener.
 	///

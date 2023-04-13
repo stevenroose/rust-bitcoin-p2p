@@ -5,7 +5,7 @@ use std::cmp;
 use std::collections::{BinaryHeap, HashSet};
 use std::time::Instant;
 
-use bitcoin::hashes::sha256d;
+use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::network::message::NetworkMessage;
 use bitcoin::network::message_blockdata::Inventory;
 use lru::LruCache;
@@ -18,12 +18,14 @@ use crate::{Config, PeerId, PeerState, PeerType};
 //TODO(stevenroose) replace with https://github.com/rust-bitcoin/rust-bitcoin/pull/515
 fn inv_hash(inv: &Inventory) -> sha256d::Hash {
 	match *inv {
-		Inventory::Error => sha256d::Hash::default(),
-		Inventory::Transaction(t) => t.as_hash(),
-		Inventory::Block(b) => b.as_hash(),
-		//Inventory::WTx(t) => t.as_hash(),
-		Inventory::WitnessTransaction(t) => t.as_hash(),
-		Inventory::WitnessBlock(b) => b.as_hash(),
+		Inventory::Error => sha256d::Hash::all_zeros(),
+		Inventory::Transaction(t) => t.to_raw_hash(),
+		Inventory::Block(b) => b.to_raw_hash(),
+		Inventory::CompactBlock(b) => b.to_raw_hash(),
+		Inventory::WTx(t) => t.to_raw_hash(),
+		Inventory::WitnessTransaction(t) => t.to_raw_hash(),
+		Inventory::WitnessBlock(b) => b.to_raw_hash(),
+        Inventory::Unknown { hash, .. } => sha256d::Hash::from_byte_array(hash),
 	}
 }
 
@@ -70,52 +72,17 @@ pub fn queue_inventory(state: &mut PeerState, inv: Inventory) -> Option<NetworkM
 			trace!("Directly relaying inv item {:?}", inv);
 			Some(NetworkMessage::Inv(vec![inv]))
 		}
-		Inventory::Transaction(_) | Inventory::WitnessTransaction(_) => {
+		Inventory::CompactBlock(_) => {
+            //TODO(stevenroose) compact blocks
+            None
+		}
+		Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_) => {
 			trace!("Queued inv item {:?} for peer", inv);
 			state.inventory.inv_queue.insert(inv);
 			None
 		}
+        Inventory::Unknown { .. } => None,
 		Inventory::Error => None,
-	}
-}
-
-/// The same as Inventory but with Ord implemented.
-//TODO(stevenroose) remove with https://github.com/rust-bitcoin/rust-bitcoin/pull/517
-#[derive(PartialEq, Eq, Clone, Debug, Copy, Hash, PartialOrd, Ord)]
-enum InvWithOrd {
-	/// Error --- these inventories can be ignored
-	Error,
-	/// Transaction
-	Transaction(bitcoin::Txid),
-	/// Block
-	Block(bitcoin::BlockHash),
-	/// Witness Transaction
-	WitnessTransaction(bitcoin::Txid),
-	/// Witness Block
-	WitnessBlock(bitcoin::BlockHash),
-}
-
-impl From<Inventory> for InvWithOrd {
-	fn from(i: Inventory) -> InvWithOrd {
-		match i {
-			Inventory::Error => InvWithOrd::Error,
-			Inventory::Transaction(t) => InvWithOrd::Transaction(t),
-			Inventory::Block(t) => InvWithOrd::Block(t),
-			Inventory::WitnessTransaction(t) => InvWithOrd::WitnessTransaction(t),
-			Inventory::WitnessBlock(t) => InvWithOrd::WitnessBlock(t),
-		}
-	}
-}
-
-impl Into<Inventory> for InvWithOrd {
-	fn into(self) -> Inventory {
-		match self {
-			InvWithOrd::Error => Inventory::Error,
-			InvWithOrd::Transaction(t) => Inventory::Transaction(t),
-			InvWithOrd::Block(t) => Inventory::Block(t),
-			InvWithOrd::WitnessTransaction(t) => Inventory::WitnessTransaction(t),
-			InvWithOrd::WitnessBlock(t) => Inventory::WitnessBlock(t),
-		}
 	}
 }
 
@@ -145,12 +112,11 @@ pub fn scheduled_trickle(
 	for inv in state.inventory.inv_queue.iter() {
 		// Take all queued invs and order them by random.
 		//TODO(stevenroose) Core orders by fee, but we don't know fee. consider closure
-		items.push((rand::random::<u32>(), InvWithOrd::from(*inv)));
+		items.push((rand::random::<u32>(), *inv));
 	}
 
 	let mut invs = Vec::with_capacity(cmp::min(config.max_inventory_broadcast_size, items.len()));
 	while let Some((_, inv)) = items.pop() {
-		let inv: Inventory = inv.into();
 		invs.push(inv);
 		state.inventory.inv_queue.remove(&inv);
 		state.inventory.known_inventory.put(inv_hash(&inv), ());

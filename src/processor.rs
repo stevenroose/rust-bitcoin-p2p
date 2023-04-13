@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use bitcoin::consensus::encode::{self, Decodable, Encodable};
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::network::constants::Magic;
 
 use crate::{Event, Listener, PeerId, P2P};
 use crate::logic::{self, Reactions, Scheduler};
@@ -52,7 +53,7 @@ enum ReadError {
 	DoS(&'static str),
 	Tcp(io::Error),
 	Encode(encode::Error),
-	WrongMagic(u32),
+	WrongMagic(Magic),
 }
 
 /// This is a type of writer that will first try to write bytes to the TCP
@@ -90,7 +91,7 @@ impl<'a> io::Write for TryTcpWriter<'a> {
 /// Write queued messages for the peer into its TCP stream.
 ///
 /// This method is outside of Thread for borrowck reasons.
-fn handle_write(peer: PeerId, pio: &mut PeerIo, magic: u32) -> Result<(), io::Error> {
+fn handle_write(peer: PeerId, pio: &mut PeerIo, magic: Magic) -> Result<(), io::Error> {
 	// Check if we have some leftover bytes from last write.
 	let peer_buf = &mut pio.buf_out;
 	if !peer_buf.is_empty() {
@@ -124,12 +125,7 @@ fn handle_write(peer: PeerId, pio: &mut PeerIo, magic: u32) -> Result<(), io::Er
 			stream: &mut pio.conn,
 			remain: peer_buf,
 		};
-		//TODO(stevenroose) change this to `?` after the Encodable signature changed
-		match raw_msg.consensus_encode(&mut writer) {
-			Ok(_) => {}
-			Err(encode::Error::Io(err)) => return Err(err),
-			Err(_) => panic!("these should be impossible, see TODO about signature"),
-		};
+		raw_msg.consensus_encode(&mut writer)?;
 
 		if !peer_buf.is_empty() {
 			break;
@@ -306,7 +302,6 @@ impl Thread {
 
 			// Then try to parse messages in the buffer.
 			let full_buffer = cursor.get_ref().len() == cursor.get_ref().capacity();
-			'parsing:
 			loop {
 				let start_pos = cursor.position() as usize;
 				let raw_msg = match RawNetworkMessage::consensus_decode(&mut cursor) {
@@ -343,11 +338,6 @@ impl Thread {
 							}
 							continue 'reading;
 						}
-					}
-					Err(encode::Error::UnrecognizedNetworkCommand(ref cmd)) => {
-						//TODO(stevenroose) I think this will change with the NetworkMessage::Unknown variant
-						warn!("{} Ignoring unknown '{}' message", peer, cmd);
-						continue 'parsing;
 					}
 					Err(e) => return Err(ReadError::Encode(e)),
 				};

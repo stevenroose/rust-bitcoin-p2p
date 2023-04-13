@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate log;
 
+use std::thread;
 use std::time::Duration;
 
 use bitcoin::network::constants::ServiceFlags;
@@ -35,23 +36,31 @@ fn main() {
 		services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
 		..Default::default()
 	}).unwrap();
+	thread::sleep(Duration::from_secs(3));
 
+	info!("Connecting TCP");
 	let conn1 = mio::net::TcpStream::connect("127.0.0.1:18444".parse().unwrap()).unwrap();
+	thread::sleep(Duration::from_secs(3));
+	info!("Adding peer");
 	let _p1 = p2p.add_peer(conn1, PeerType::Outbound).expect("adding peer");
+	thread::sleep(Duration::from_secs(3));
 
 	// Add logger.
 	// fn log_event(event: &Event) -> bool {
 	// 	trace!("New event received: {:?}", event);
 	// 	true
 	// }
-	let log_event: Box<dyn for<'e> FnMut(&'e Event) -> bool + Send> = Box::new(|event: &Event| {
+	let log_event = |event: &Event| {
 		trace!("New event received: {:?}", event);
 		true
-	});
+	};
+	info!("Adding listener");
 	p2p.add_listener(log_event).unwrap();
 
+	info!("Creating channel");
 	let receiver = p2p.create_listener_channel().unwrap();
 	for event in receiver.iter() {
+		trace!("Event: {:?}", event);
 		if let Event::Connected(peer) = event {
 			info!("Peer {} connected!", peer);
 		}
