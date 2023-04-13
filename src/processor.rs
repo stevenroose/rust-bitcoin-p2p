@@ -289,16 +289,17 @@ impl Thread {
 				cursor.get_mut().set_len(capacity);
 			}
 			let count = pio.conn.read(&mut cursor.get_mut()[len..]).map_err(ReadError::Tcp)?;
-			debug_assert!(count + len <= cursor.get_ref().capacity());
-			unsafe {
-				cursor.get_mut().set_len(count + len);
-			}
-			trace!("Peer {} read {} bytes", peer, count);
 
 			if count == 0 {
 				// In mio's non-blocking I/O, an `Ok(0)` means EOF.
 				return Err(ReadError::Disconnected);
 			}
+
+			debug_assert!(count + len <= cursor.get_ref().capacity());
+			unsafe {
+				cursor.get_mut().set_len(count + len);
+			}
+			trace!("Peer {} read {} bytes", peer, count);
 
 			// Then try to parse messages in the buffer.
 			let full_buffer = cursor.get_ref().len() == cursor.get_ref().capacity();

@@ -1,3 +1,5 @@
+
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bitcoin::network::constants::{Network, ServiceFlags, PROTOCOL_VERSION};
@@ -55,7 +57,7 @@ pub struct Config {
 	/// The maximum capacity of the known inventory to keep for each peer.
 	///
 	/// Default value: 100.
-	pub max_inventory_size: usize,
+	pub max_inventory_size: NonZeroUsize,
 
 	/// The maximum number of inventory items to broadcast each interval.
 	///
@@ -91,7 +93,7 @@ impl Default for Config {
 			user_agent: "rust_bitcoin/bitcoin_p2p".to_owned(),
 			max_msg_queue_size: 25,
 			ping_interval: Duration::from_secs(2 * 60),
-			max_inventory_size: 100,
+			max_inventory_size: NonZeroUsize::new(100).unwrap(),
 			max_inventory_broadcast_size: 35,
 			avg_inventory_broadcast_interval_inbound: Duration::from_secs(5),
 			avg_inventory_broadcast_interval_outbound: Duration::from_secs(2),
