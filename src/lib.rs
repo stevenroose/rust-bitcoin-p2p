@@ -27,6 +27,14 @@ use bitcoin::network::message_network::VersionMessage;
 use processor::Ctrl;
 use utils::WakerSender;
 
+/// The return type of the [Listener::event] method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerResult {
+    /// All normal.
+    Ok,
+    /// The listener asks for itself to be removed.
+    RemoveMe,
+}
 
 /// Trait used to listen to events.
 ///
@@ -38,36 +46,37 @@ use utils::WakerSender;
 pub trait Listener: Send + 'static {
 	/// Handle a new incoming event.
 	///
-	/// Should return false if the listener should be removed, true otherwise.
-	///
 	/// It's very important that the execution of this method is fast and
 	/// certainly never blocks the thread. That's why it's probably advised to
 	/// not implement this trait on your actual handler but on a channel to
 	/// queue the events or an async function.
-	fn event(&mut self, event: &Event) -> bool;
+	fn event(&mut self, event: &Event) -> ListenerResult;
 }
 
 impl Listener for mpsc::Sender<Event> {
-	fn event(&mut self, event: &Event) -> bool {
-		self.send(event.clone()).is_ok()
+	fn event(&mut self, event: &Event) -> ListenerResult {
+		match self.send(event.clone()) {
+            Ok(_) => ListenerResult::Ok,
+            Err(_) => ListenerResult::RemoveMe,
+        }
 	}
 }
 
 impl Listener for mpsc::SyncSender<Event> {
-	fn event(&mut self, event: &Event) -> bool {
+	fn event(&mut self, event: &Event) -> ListenerResult {
 		match self.try_send(event.clone()) {
-			Ok(()) => true,
+			Ok(()) => ListenerResult::Ok,
 			Err(mpsc::TrySendError::Full(e)) => {
 				warn!("Sync channel event listener full; dropping event: {:?}", e);
-				true
+				ListenerResult::Ok
 			}
-			Err(mpsc::TrySendError::Disconnected(_)) => false,
+			Err(mpsc::TrySendError::Disconnected(_)) => ListenerResult::RemoveMe,
 		}
 	}
 }
 
-impl<F: for<'e> FnMut(&'e Event) -> bool + Send + 'static> Listener for F {
-	fn event(&mut self, event: &Event) -> bool {
+impl<F: for<'e> FnMut(&'e Event) -> ListenerResult + Send + 'static> Listener for F {
+	fn event(&mut self, event: &Event) -> ListenerResult {
 		self(event)
 	}
 }
@@ -161,7 +170,7 @@ pub struct P2P {
 	peers: Mutex<HashMap<PeerId, PeerState>>,
 
 	/// Handle to send control messages to the processor thread.
-	ctrl_tx: Mutex<WakerSender<Ctrl>>,
+	ctrl_tx: Mutex<Option<WakerSender<Ctrl>>>,
 
 	/// The current block height of our client to advertise to peers.
 	block_height: atomic::AtomicU32,
@@ -169,29 +178,33 @@ pub struct P2P {
 
 impl P2P {
 	/// Instantiate a P2P coordinator.
-	pub fn new(config: Config) -> Result<Arc<P2P>, Error> {
-		// Create the control message channel.
-		let (ctrl_tx, ctrl_rx) = mpsc::channel();
-
-		// Create the processor thread and receive the waker.
-		let (processor, waker) = processor::Thread::new(ctrl_rx)?;
-		let ctrl_tx = WakerSender::new(ctrl_tx, waker);
-
+	pub fn new(config: Config) -> Arc<P2P> {
 		let p2p = Arc::new(P2P {
 			config: config,
 			next_peer_id: atomic::AtomicUsize::new(1),
 			peers: Mutex::new(HashMap::new()),
-			ctrl_tx: Mutex::new(ctrl_tx),
+			ctrl_tx: Mutex::new(None),
 			block_height: atomic::AtomicU32::new(0),
 		});
 
-		let p2p_cloned = p2p.clone();
-		thread::Builder::new()
-			.name("bitcoin_p2p_thread".into())
-			.spawn(|| processor.run(p2p_cloned))?;
-
-		Ok(p2p)
+		p2p
 	}
+
+    pub fn start(self: &Arc<Self>) -> Result<(), Error> {
+		// Create the control message channel.
+		let (ctrl_tx, ctrl_rx) = mpsc::channel();
+
+		// Create the processor thread and receive the waker.
+        let self_handle = self.clone();
+		let (processor, waker) = processor::Thread::new(self_handle, ctrl_rx)?;
+        *self.ctrl_tx.lock().unwrap() = Some(WakerSender::new(ctrl_tx, waker));
+
+        //TODO(stevenroose) keep the joinhandle?
+		let _ = thread::Builder::new()
+			.name("bitcoin_p2p_thread".into())
+			.spawn(|| processor.run())?;
+        Ok(())
+    }
 
 	/// Get the configuration of the P2P instance.
 	pub fn config(&self) -> &Config {
@@ -219,7 +232,8 @@ impl P2P {
 
 	/// Queue a new control message to the processor thread.
 	fn send_ctrl(&self, ctrl: Ctrl) -> Result<(), Error> {
-		self.ctrl_tx.lock().unwrap().send(ctrl).map_err(|_| Error::Shutdown)
+		self.ctrl_tx.lock().unwrap().as_ref().ok_or(Error::NotStartedYet)?
+            .send(ctrl).map_err(|_| Error::Shutdown)
 	}
 
 	/// Shut down the p2p operation. Any subsequent call will be a no-op.

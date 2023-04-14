@@ -72,7 +72,7 @@ impl Scheduler {
 
 	/// Handle all due events.
 	pub fn handle_events_due(&mut self, p2p: &Arc<P2P>, react: &mut Reactions) {
-		#[allow(unused)] //TODO(stevenroose) cargo complains about this
+		#[allow(unused)] // NB cargo complains about this
 		let mut peers_lock = None;
 		macro_rules! get_state {
 			($peer:expr) => {{
@@ -115,6 +115,7 @@ enum Action {
 
 /// Multiple actions to be made.
 //TODO(stevenroose) consider making into a LinkedList for more efficient draining
+// this makes more sense when linked_list_entry lands and has a remove method
 pub struct Reactions(Vec<Action>);
 
 impl Reactions {

@@ -123,5 +123,7 @@ pub fn handle_verack(react: &mut Reactions, config: &Config, peer: PeerId, state
 	}
 
 	// Schedule the first ping.
-	react.schedule_ping(peer, Instant::now() + config.ping_interval);
+    if let Some(int) = config.ping_interval {
+	    react.schedule_ping(peer, Instant::now() + int);
+    }
 }

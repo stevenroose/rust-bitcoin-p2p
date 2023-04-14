@@ -1,4 +1,4 @@
-
+//! 
 use std::{io, ptr, net};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read, Write};
@@ -9,7 +9,7 @@ use bitcoin::consensus::encode::{self, Decodable, Encodable};
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::network::constants::Magic;
 
-use crate::{Event, Listener, PeerId, P2P};
+use crate::{Event, Listener, ListenerResult, PeerId, P2P};
 use crate::logic::{self, Reactions, Scheduler};
 
 const WAKE_TOKEN: mio::Token = mio::Token(0);
@@ -157,14 +157,14 @@ pub struct Thread {
 }
 
 impl Thread {
-	pub fn new(ctrl_rx: mpsc::Receiver<Ctrl>) -> Result<(Thread, mio::Waker), io::Error> {
+	pub fn new(p2p: Arc<P2P>, ctrl_rx: mpsc::Receiver<Ctrl>) -> Result<(Thread, mio::Waker), io::Error> {
 		let poll = mio::Poll::new()?;
 		let waker = mio::Waker::new(poll.registry(), WAKE_TOKEN)?;
 
 		let thread = Thread {
 			// This is quite ugly, but because we have a circular dependency,
 			// we can only get this Arc in the [run] method below.
-			p2p: unsafe { Arc::from_raw(ptr::null()) },
+			p2p: p2p,
 			poll: poll,
 			ctrl_rx: ctrl_rx,
 			scheduler: Scheduler::new(),
@@ -179,7 +179,7 @@ impl Thread {
 		// We iterate backwards over the listeners so that we can efficiently
 		// remove them if needed.
 		for i in (0..self.listeners.len()).rev() {
-			if !self.listeners.get_mut(i).unwrap().event(&event) {
+			if self.listeners.get_mut(i).unwrap().event(&event) == ListenerResult::RemoveMe {
 				debug!("Some listener was disconnected, so we remove it");
 				// This removes the item and replaces it with the last one, so we
 				// can continue iterating backwards without having to mess with
@@ -447,9 +447,8 @@ impl Thread {
 	}
 
 	/// Run the thread.
-	pub fn run(mut self, p2p: Arc<P2P>) {
+	pub fn run(mut self) {
 		info!("P2P processor thread starting...");
-		self.p2p = p2p;
 
 		// To capture poll events.
 		let mut events = mio::Events::with_capacity(1024);
@@ -459,9 +458,9 @@ impl Thread {
 		// for TCP streams.
 		let mut buffer = Vec::with_capacity(bitcoin::consensus::encode::MAX_VEC_SIZE);
 
-
 		let mut peers = HashMap::new();
 
+        trace!("Entering main loop...");
 		loop {
 			events.clear();
 

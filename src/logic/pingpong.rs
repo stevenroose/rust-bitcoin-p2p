@@ -23,7 +23,9 @@ pub fn scheduled_ping(react: &mut Reactions, config: &Config, peer: PeerId, stat
 	}
 
 	// Schedule next ping.
-	react.schedule_ping(peer, Instant::now() + config.ping_interval);
+    if let Some(int) = config.ping_interval {
+        react.schedule_ping(peer, Instant::now() + int);
+    }
 
 	let nonce = rand::random();
 	state.ping_stats.last_nonce = nonce;

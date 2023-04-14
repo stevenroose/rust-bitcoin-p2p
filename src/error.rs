@@ -5,6 +5,7 @@ use crate::PeerId;
 
 #[derive(Debug)]
 pub enum Error {
+    NotStartedYet,
 	/// No peer with given ID known. He must have been disconnected.
 	PeerDisconnected(PeerId),
 	/// We have already shut down.
@@ -26,6 +27,7 @@ impl From<io::Error> for Error {
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
+			Error::NotStartedYet => write!(f, "P2P hasn't started yet"),
 			Error::PeerDisconnected(id) => write!(f, "peer disconnected: {}", id),
 			Error::Shutdown => write!(f, "P2P is already shut down"),
 			Error::Io(ref e) => write!(f, "I/O error: {}", e),

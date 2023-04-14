@@ -4,6 +4,11 @@ use std::time::Duration;
 
 use bitcoin::network::constants::{Network, ServiceFlags, PROTOCOL_VERSION};
 
+//TODO(stevenroose) make constants for other defaults
+
+/// The default ping interval is 2 minutes.
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
+
 /// Configuration options for P2P.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -51,8 +56,8 @@ pub struct Config {
 
 	/// The interval at which to ping peers.
 	///
-	/// Default value: 2 minutes.
-	pub ping_interval: Duration,
+	/// Default value: 2 minutes. If [None], don't ping peers.
+	pub ping_interval: Option<Duration>,
 
 	/// The maximum capacity of the known inventory to keep for each peer.
 	///
@@ -90,9 +95,9 @@ impl Default for Config {
 			relay: false,
 			send_headers: false,
 			send_compact_blocks: false,
-			user_agent: "rust_bitcoin/bitcoin_p2p".to_owned(),
+			user_agent: "rust-bitcoin/bitcoin-p2p".to_owned(),
 			max_msg_queue_size: 25,
-			ping_interval: Duration::from_secs(2 * 60),
+			ping_interval: Some(DEFAULT_PING_INTERVAL),
 			max_inventory_size: NonZeroUsize::new(100).unwrap(),
 			max_inventory_broadcast_size: 35,
 			avg_inventory_broadcast_interval_inbound: Duration::from_secs(5),

@@ -4,7 +4,7 @@ use std::sync::mpsc;
 
 use rand_distr::{Distribution, Poisson};
 
-use crate::{Event, Listener};
+use crate::{Event, Listener, ListenerResult};
 
 /// Get a poisson sample averaging the given number.
 pub fn poisson_u64(avg: u64) -> u64 {
@@ -62,13 +62,13 @@ impl<T> WakerSender<T> {
 }
 
 impl Listener for WakerSender<Event> {
-	fn event(&mut self, event: &Event) -> bool {
+	fn event(&mut self, event: &Event) -> ListenerResult {
 		match self.send(event.clone()) {
-			Ok(()) => true,
+			Ok(()) => ListenerResult::Ok,
 			// The channel disconnected.
-			Err(WakerSenderError::Send(_)) => false,
+			Err(WakerSenderError::Send(_)) => ListenerResult::RemoveMe,
 			// The waker has I/O problems, the mio::Poll might no longer exist.
-			Err(WakerSenderError::Wake(_)) => false,
+			Err(WakerSenderError::Wake(_)) => ListenerResult::RemoveMe,
 		}
 	}
 }

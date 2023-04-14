@@ -28,18 +28,22 @@ fn setup_logger() {
 
 
 fn main() {
+    info!("Setting up logging...");
 	setup_logger();
 
+    info!("Instantiating...");
 	let p2p = P2P::new(Config {
-		network: bitcoin::Network::Regtest,
+		network: bitcoin::Network::Signet,
 		ping_interval: Duration::from_secs(3 * 60),
 		services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
 		..Default::default()
 	}).unwrap();
+    p2p.start();
+    info!("Sleeping...");
 	thread::sleep(Duration::from_secs(3));
 
-	info!("Connecting TCP");
-	let conn1 = mio::net::TcpStream::connect("127.0.0.1:18444".parse().unwrap()).unwrap();
+	info!("Connecting TCP...");
+	let conn1 = mio::net::TcpStream::connect("127.0.0.1:38333".parse().unwrap()).unwrap();
 	thread::sleep(Duration::from_secs(3));
 	info!("Adding peer");
 	let _p1 = p2p.add_peer(conn1, PeerType::Outbound).expect("adding peer");
