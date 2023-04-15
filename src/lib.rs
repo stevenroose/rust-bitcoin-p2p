@@ -13,6 +13,8 @@ mod error;
 mod logic;
 mod processor;
 
+pub mod connmgr;
+
 pub use config::Config;
 pub use error::Error;
 

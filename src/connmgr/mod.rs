@@ -1,11 +1,12 @@
 
-use std::{io, fmt, net, ptr, thread};
-use std::collections::HashMap;
+use std::{io, fmt, net, thread};
+use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
+use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
-use crate::{Event, PeerId, PeerType};
+use crate::{Event, ListenerResult, PeerId, PeerType};
 use crate::utils::{self, WakerSender};
 
 const WAKE_TOKEN: mio::Token = mio::Token(0);
@@ -45,7 +46,7 @@ pub struct Config {
     pub max_inbound_peers: usize,
 
 	/// Maximum number of disconnected peers to remember.
-	pub disconnected_peers_cache_size: usize,
+	pub disconnected_peers_cache_size: NonZeroUsize,
 }
 //TODO(stevenroose) default
 
@@ -60,19 +61,19 @@ pub type RemovePeerFn = dyn FnMut(PeerId) -> Result<(), crate::Error> + Send;
 pub struct ConnMgrListener(WakerSender<Event>);
 
 impl crate::Listener for ConnMgrListener {
-	fn event(&mut self, event: &Event) -> bool {
+	fn event(&mut self, event: &Event) -> ListenerResult {
 		// Skip Message events.
 		if let Event::Message(..) = event {
 			//TODO(stevenroose) perhaps we want some messages?
-			return true;
+			return ListenerResult::Ok;
 		}
 
 		match self.0.send(event.clone()) {
-			Ok(()) => true,
+			Ok(()) => ListenerResult::Ok,
 			// The channel disconnected.
-			Err(utils::WakerSenderError::Send(_)) => false,
+			Err(utils::WakerSenderError::Send(_)) => ListenerResult::RemoveMe,
 			// The waker has I/O problems, the mio::Poll might no longer exist.
-			Err(utils::WakerSenderError::Wake(_)) => false,
+			Err(utils::WakerSenderError::Wake(_)) => ListenerResult::RemoveMe,
 		}
 	}
 }
@@ -84,21 +85,26 @@ struct PeerInfo {
 	handshake: bool,
 }
 
+struct Data {
+    /// The interfaces we are listening on.
+    listeners: HashSet<net::SocketAddr>,
+
+	/// The set of connected peers.
+	connected: HashMap<PeerId, PeerInfo>,
+	/// The set of recently disconnected peers.
+	disconnected: LruCache<net::SocketAddr, ()>,
+}
+
 /// Manager the amount of connections to maintain
 /// and listen for incoming connections etc.
 pub struct ConnectionManager {
 	config: Config,
 
-    /// The interfaces we are listening on.
-    listeners: Mutex<HashSet<net::SocketAddr>>,
-
-	/// The set of connected peers.
-	connected: Mutex<HashMap<PeerId, PeerInfo>>,
-	/// The set of recently disconnected peers.
-	disconnected: Mutex<LruCache<net::SocketAddr, ()>>,
+    /// The data shared with the runtime.
+    data: Arc<Mutex<Data>>,
 
 	/// Handle to the control msg channel.
-	ctrl_tx: Mutex<WakerSender<Ctrl>>,
+	ctrl_tx: WakerSender<Ctrl>,
 }
 
 impl ConnectionManager {
@@ -106,11 +112,11 @@ impl ConnectionManager {
 	///
 	/// Also returns an event [Listener] that should be registred as a
 	/// listener with the [P2P].
-	pub fn new<A, R>(
+	pub fn start<A, R>(
 		config: Config,
 		add_peer: A,
 		remove_peer: R,
-	) -> Result<(Arc<ConnectionManager>, ConnMgrListener), io::Error>
+	) -> Result<(ConnectionManager, ConnMgrListener), io::Error>
 	where
 		A: FnMut(mio::net::TcpStream, PeerType) -> Result<PeerId, crate::Error> + Send + 'static,
 		R: FnMut(PeerId) -> Result<(), crate::Error> + Send + 'static,
@@ -118,50 +124,53 @@ impl ConnectionManager {
 		let (ctrl_tx, ctrl_rx) = mpsc::channel();
 		let (event_tx, event_rx) = mpsc::channel();
 
-		let (thread, poll_registry) = RuntimeData::new(
-			ctrl_rx,
-			event_rx,
-			Box::new(add_peer),
-			Box::new(remove_peer),
-		)?;
+        let data = Arc::new(Mutex::new(Data {
+			connected: HashMap::new(),
+			disconnected: LruCache::new(config.disconnected_peers_cache_size),
+            listeners: HashSet::new(),
+        }));
 
-		let ctrl_tx = WakerSender::new(ctrl_tx, mio::Waker::new(&poll_registry, WAKE_TOKEN)?);
-		let event_tx = WakerSender::new(event_tx, mio::Waker::new(&poll_registry, WAKE_TOKEN)?);
+		let rt = Runtime {
+            data: data.clone(),
+            ctrl_rx: ctrl_rx,
+            event_rx: event_rx,
 
-		let mgr = Arc::new(ConnectionManager {
-			connected: Mutex::new(HashMap::new()),
-			disconnected: Mutex::new(LruCache::new(config.disconnected_peers_cache_size)),
-			ctrl_tx: Mutex::new(ctrl_tx),
+            // Here we'll keep all our TCP listeners.
+            // Just keep a vector as we don't expect this to be big.
+            listener_id_counter: 0,
+            listeners: Vec::new(),
+            
+            // Closures to add and remove peers.
+            add_peer_fn: Box::new(add_peer),
+            remove_peer_fn: Box::new(remove_peer),
+        };
+
+        let registry = run_processor_thread("bitcoin_p2p_connmgr_thread".into(), rt)?;
+
+		let ctrl_tx = WakerSender::new(ctrl_tx, mio::Waker::new(&registry, WAKE_TOKEN)?);
+		let event_tx = WakerSender::new(event_tx, mio::Waker::new(&registry, WAKE_TOKEN)?);
+
+		let mgr = ConnectionManager {
+            data: data,
+			ctrl_tx: ctrl_tx,
 			config: config,
-		});
-
-		let mgr_cloned = mgr.clone();
-		thread::Builder::new()
-			.name("bitcoin_p2p_connmgr_thread".into())
-			.spawn(|| thread.run(mgr_cloned))?;
+		};
 
 		Ok((mgr, ConnMgrListener(event_tx)))
 	}
 
     /// The set of listeners we are listening on.
     pub fn listeners(&self) -> HashSet<net::SocketAddr> {
-        self.listeners.lock().unwrap().clone()
-    }
-
-    pub fn start(self: &Arc<ConnectionManager>) {
-        //TODO(stevenroose) 
+        self.data.lock().unwrap().listeners.clone()
     }
 
 	fn send_ctrl(&self, ctrl: Ctrl) -> Result<(), Error> {
-		self.ctrl_tx.lock().unwrap().send(ctrl).map_err(|_| Error::Shutdown)
+		self.ctrl_tx.send(ctrl).map_err(|_| Error::Shutdown)
 	}
 
     /// Add a new TCP listener.
-    // dev note: It's important to use this method internally in the other methods
-    // as it registers the listener in the local set.
     pub fn add_mio_listener(&self, listener: mio::net::TcpListener) -> Result<(), Error> {
-        self.listeners.lock().unwrap().insert(listener.local_addr()?);
-		self.send_ctrl(Ctrl::AddListener(addr, list))
+		self.send_ctrl(Ctrl::AddListener(listener.local_addr()?, listener))
     }
 
 	/// Start listening for incoming connections on the given address.
@@ -177,10 +186,49 @@ impl ConnectionManager {
 
 	/// Stop listening on the given address.
 	pub fn stop_listening(&self, addr: net::SocketAddr) -> Result<(), Error> {
-        //TODO(stevenroose) should we error here if we notice we don't have this addr?
-        self.listeners.lock().unwrap().remove(&addr);
 		self.send_ctrl(Ctrl::RemoveListener(addr))
 	}
+}
+
+#[derive(Clone, Copy)]
+pub enum Token {
+    ConnMgr(usize),
+}
+
+impl Into<mio::Token> for Token {
+    fn into(self) -> mio::Token {
+        //TODO(stevenroose) 
+        mio::Token(0)
+    }
+}
+
+pub trait ThreadedRuntime: Send + 'static {
+    //TODO(stevenroose) make custom event type
+    fn wakeup(&mut self, registry: &mio::Registry, events: &mio::Events);
+}
+
+pub fn run_processor_thread<R: ThreadedRuntime>(
+    name: String,
+    mut rt: R,
+) -> Result<mio::Registry, io::Error> {
+    let mut poll = mio::Poll::new()?;
+    let registry = poll.registry().try_clone()?;
+    thread::Builder::new().name(name).spawn(move || {
+		info!("ConnectionManager thread started");
+
+        // Setup the required mio types.
+		let mut events = mio::Events::with_capacity(1024);
+		
+		loop {
+			events.clear();
+
+            //TODO(stevenroose) timeout
+			poll.poll(&mut events, None).expect("poll error");
+
+            rt.wakeup(poll.registry(), &events);
+		}
+    })?;
+    Ok(registry)
 }
 
 enum Ctrl {
@@ -190,12 +238,16 @@ enum Ctrl {
 	RemoveListener(net::SocketAddr),
 }
 
-struct RuntimeData {
-	mgr: Arc<ConnectionManager>,
+struct Runtime {
+    data: Arc<Mutex<Data>>,
 
-	poll: mio::Poll,
 	ctrl_rx: mpsc::Receiver<Ctrl>,
 	event_rx: mpsc::Receiver<Event>,
+
+    // Here we'll keep all our TCP listeners.
+    // Just keep a vector as we don't expect this to be big.
+    listener_id_counter: usize,
+    listeners: Vec::<Listener>,
 	
 	// Closures to add and remove peers.
 	add_peer_fn: Box<AddPeerFn>,
@@ -208,27 +260,7 @@ struct Listener {
 	listener: mio::net::TcpListener,
 }
 
-impl RuntimeData {
-	fn new(
-		ctrl_rx: mpsc::Receiver<Ctrl>,
-		event_rx: mpsc::Receiver<Event>,
-		add_peer_fn: Box<AddPeerFn>,
-		remove_peer_fn: Box<RemovePeerFn>,
-	) -> Result<(RuntimeData, mio::Registry), io::Error> {
-		let poll = mio::Poll::new()?;
-		let registry = poll.registry().try_clone()?;
-
-		let thread = RuntimeData {
-			mgr: unsafe { Arc::from_raw(ptr::null()) },
-			poll: poll,
-			ctrl_rx: ctrl_rx,
-			event_rx: event_rx,
-			add_peer_fn: add_peer_fn,
-			remove_peer_fn: remove_peer_fn,
-		};
-		Ok((thread, registry))
-	}
-
+impl Runtime {
 	fn add_peer(&mut self, addr: net::SocketAddr, stream: mio::net::TcpStream, tp: PeerType) {
 		let id = match (*self.add_peer_fn)(stream, tp) {
 			Ok(id) => id,
@@ -243,13 +275,13 @@ impl RuntimeData {
 			peer_type: tp,
 			handshake: false,
 		};
-		if let Some(dup) = self.mgr.connected.lock().unwrap().insert(id, info) {
+		if let Some(dup) = self.data.lock().unwrap().connected.insert(id, info) {
 			error!("Duplicate peer ID {}: {} and {}", id, dup.addr, addr);
 		}
 	}
 
 	fn peer_connected(&mut self, peer: PeerId) {
-		if let Some(info) = self.mgr.connected.lock().unwrap().get_mut(&peer) {
+		if let Some(info) = self.data.lock().unwrap().connected.get_mut(&peer) {
 			info.handshake = true;
 			debug!("Peer {} ({}) finished handshake", peer, info.addr);
 		} else {
@@ -258,99 +290,90 @@ impl RuntimeData {
 	}
 
 	fn peer_disconnected(&mut self, peer: PeerId) {
-		if let Some(info) = self.mgr.connected.lock().unwrap().remove(&peer) {
+		if let Some(info) = self.data.lock().unwrap().connected.remove(&peer) {
 			debug!("Peer {} ({}) disconnected", peer, info.addr);
-			self.mgr.disconnected.lock().unwrap().put(info.addr, ());
+			self.data.lock().unwrap().disconnected.put(info.addr, ());
 		} else {
 			error!("Received Disconnected event for peer that we don't know: {}", peer);
 		}
 	}
+}
 
-	fn run(mut self, mgr: Arc<ConnectionManager>) {
-		self.mgr = mgr;
-		info!("ConnectionManager thread started");
+impl ThreadedRuntime for Runtime {
+	fn wakeup(&mut self, registry: &mio::Registry, events: &mio::Events) {
+        trace!("ConnectionManager runtime called");
 
-		// A counter for mio tokens to keep.
-		let mut token_counter = 0;
+        while let Ok(ctrl) = self.ctrl_rx.try_recv() {
+            match ctrl {
+                Ctrl::AddListener(addr, mut list) => {
+                    self.listener_id_counter += 1;
 
-		// Here we'll keep all our TCP listeners.
-		// Just keep a vector as we don't expect this to be big.
-		let mut listeners = Vec::<Listener>::new();
+                    let token = mio::Token(self.listener_id_counter);
+                    registry.register(&mut list, token, mio::Interest::READABLE)
+                        .expect("TCP listener poll registry failed");
 
-		// To capture poll events.
-		let mut events = mio::Events::with_capacity(1024);
-		
-		loop {
-			events.clear();
+                    // Check for duplicates.
+                    if self.listeners.iter().any(|l| l.addr == addr) {
+                        error!("Duplicate listener address: {}; ignoring", addr);
+                        continue;
+                    }
+                    
+                    self.listeners.push(Listener {
+                        token: token,
+                        addr: addr,
+                        listener: list,
+                    });
+                }
 
-			self.poll.poll(&mut events, None).expect("poll error");
-			trace!("connmgr woken up");
+                Ctrl::RemoveListener(addr) => {
+                    let len = self.listeners.len();
+                    self.listeners.retain(|l| l.addr != addr);
+                    if self.listeners.len() != len {
+                        debug!("Stopped listening on {}", addr);
+                    } else {
+                        error!("Asked to stop listening on {} but we are not", addr);
+                    }
+                }
+            }
+        }
 
-			while let Ok(ctrl) = self.ctrl_rx.try_recv() {
-				match ctrl {
-					Ctrl::AddListener(addr, mut list) => {
-						token_counter += 1;
+        //TODO(stevenroose) 
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                Event::Connected(peer) => self.peer_connected(peer),
+                Event::Disconnected(peer) => self.peer_disconnected(peer),
+                Event::Message(..) => unreachable!("our listener filters these"),
+            }
+        }
 
-						let token = mio::Token(token_counter);
-						self.poll.registry().register(&mut list, token, mio::Interest::READABLE)
-							.expect("TCP listener poll registry failed");
+        // borrowck workaround
+        let mut new_peers = Vec::new();
+        'events:
+        for event in events.iter().filter(|e| e.token() != WAKE_TOKEN) {
+            let list = or!(self.listeners.iter_mut().find(|l| l.token == event.token()), continue);
+            let addr = list.addr;
 
-						// Check for duplicates.
-						if listeners.iter().any(|l| l.addr == addr) {
-							error!("Duplicate listener address: {}; ignoring", addr);
-							continue;
-						}
-						
-						listeners.push(Listener {
-							token: token,
-							addr: addr,
-							listener: list,
-						});
-					}
-
-					Ctrl::RemoveListener(addr) => {
-						let len = listeners.len();
-						listeners.retain(|l| l.addr != addr);
-						if listeners.len() != len {
-							debug!("Stopped listening on {}", addr);
-						} else {
-							error!("Asked to stop listening on {} but we are not", addr);
-						}
-					}
-				}
-			}
-
-			while let Ok(event) = self.event_rx.try_recv() {
-				match event {
-					Event::Connected(peer) => self.peer_connected(peer),
-					Event::Disconnected(peer) => self.peer_disconnected(peer),
-					Event::Message(..) => unreachable!("our listener filters these"),
-				}
-			}
-
-			'events:
-			for event in events.iter().filter(|e| e.token() != WAKE_TOKEN) {
-				let list = or!(listeners.iter_mut().find(|l| l.token == event.token()), continue);
-
-				'accept:
-				loop {
-					match list.listener.accept() {
-						Ok((stream, addr)) => {
-							debug!("New TCP stream connected on {}: {}", list.addr, addr);
-							self.add_peer(addr, stream, PeerType::Inbound);
-						}
-						Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-							break 'accept;
-						}
-						Err(e) => {
-							error!("TCP listener error for {}: {}", list.addr, e);
-							drop(list);
-							listeners.retain(|l| l.token != event.token());
-							continue 'events;
-						}
-					}
-				}
-			}
-		}
+            'accept:
+            loop {
+                match list.listener.accept() {
+                    Ok((stream, new_addr)) => {
+                        debug!("New TCP stream connected on {}: {}", addr, new_addr);
+                        new_peers.push((new_addr, stream, PeerType::Inbound));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        break 'accept;
+                    }
+                    Err(e) => {
+                        error!("TCP listener error for {}: {}", addr, e);
+                        drop(list);
+                        self.listeners.retain(|l| l.token != event.token());
+                        continue 'events;
+                    }
+                }
+            }
+        }
+        for (addr, stream, tp) in new_peers {
+            self.add_peer(addr, stream, tp);
+        }
 	}
 }
