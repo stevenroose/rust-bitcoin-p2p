@@ -7,18 +7,19 @@ extern crate log;
 mod utils;
 
 pub mod constants;
+pub mod connmgr;
+
+mod mio_io;
 
 mod config;
 mod error;
 mod logic;
 mod processor;
 
-pub mod connmgr;
-
 pub use config::Config;
 pub use error::Error;
 
-use std::{fmt, net, thread};
+use std::{fmt, io, net, thread};
 use std::collections::HashMap;
 use std::sync::{atomic, mpsc, Arc, Mutex};
 
@@ -27,7 +28,7 @@ use bitcoin::network::message_blockdata::Inventory;
 use bitcoin::network::message_network::VersionMessage;
 
 use processor::Ctrl;
-use utils::WakerSender;
+use mio_io::WakerSender;
 
 /// The return type of the [Listener::event] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,8 +85,6 @@ impl<F: for<'e> FnMut(&'e Event) -> ListenerResult + Send + 'static> Listener fo
 }
 
 /// A peer identifier.
-///
-/// Can never be 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId(pub(crate) usize);
 
@@ -147,16 +146,17 @@ pub struct PeerState {
 
 /// Used to add new peers.
 pub trait IntoMioTcpStream {
-	fn into_mio_tcp_stream(self) -> mio::net::TcpStream;
+	fn into_mio_tcp_stream(self) -> Result<mio::net::TcpStream, io::Error>;
 }
 impl IntoMioTcpStream for mio::net::TcpStream {
-	fn into_mio_tcp_stream(self) -> mio::net::TcpStream {
-		self
+	fn into_mio_tcp_stream(self) -> Result<mio::net::TcpStream, io::Error> {
+		Ok(self)
 	}
 }
 impl IntoMioTcpStream for std::net::TcpStream {
-	fn into_mio_tcp_stream(self) -> mio::net::TcpStream {
-		mio::net::TcpStream::from_std(self)
+	fn into_mio_tcp_stream(self) -> Result<mio::net::TcpStream, io::Error> {
+        self.set_nonblocking(true)?;
+		Ok(mio::net::TcpStream::from_std(self))
 	}
 }
 
@@ -249,7 +249,7 @@ impl P2P {
 		conn: S,
 		peer_type: PeerType,
 	) -> Result<PeerId, Error> {
-		let conn = conn.into_mio_tcp_stream();
+		let conn = conn.into_mio_tcp_stream()?;
 		if let Some(err) = conn.take_error()? {
 			return Err(Error::PeerUnreachable(err));
 		}

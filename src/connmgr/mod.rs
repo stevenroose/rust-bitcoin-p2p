@@ -1,5 +1,5 @@
 
-use std::{io, fmt, net, thread};
+use std::{io, fmt, net};
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
 use std::num::NonZeroUsize;
@@ -7,7 +7,9 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 
 use crate::{Event, ListenerResult, PeerId, PeerType};
-use crate::utils::{self, WakerSender};
+use crate::mio_io::{
+    IoProcessor, ProcessorThread, ProcessorThreadError, TokenTally, WakerSender, WakerSenderError,
+};
 
 const WAKE_TOKEN: mio::Token = mio::Token(0);
 
@@ -51,10 +53,7 @@ pub struct Config {
 //TODO(stevenroose) default
 
 /// Closure used to add peers.
-pub type AddPeerFn = dyn FnMut(mio::net::TcpStream, PeerType) -> Result<PeerId, crate::Error> + Send;
-
-/// Closure used to remove peers.
-pub type RemovePeerFn = dyn FnMut(PeerId) -> Result<(), crate::Error> + Send;
+pub type AddPeerFn = dyn FnMut(mio::net::TcpStream, PeerType) -> Option<PeerId> + Send + 'static;
 
 /// A listener for the connection manager.
 #[derive(Debug)]
@@ -71,9 +70,9 @@ impl crate::Listener for ConnMgrListener {
 		match self.0.send(event.clone()) {
 			Ok(()) => ListenerResult::Ok,
 			// The channel disconnected.
-			Err(utils::WakerSenderError::Send(_)) => ListenerResult::RemoveMe,
+			Err(WakerSenderError::Send(_)) => ListenerResult::RemoveMe,
 			// The waker has I/O problems, the mio::Poll might no longer exist.
-			Err(utils::WakerSenderError::Wake(_)) => ListenerResult::RemoveMe,
+			Err(WakerSenderError::Wake(_)) => ListenerResult::RemoveMe,
 		}
 	}
 }
@@ -112,15 +111,11 @@ impl ConnectionManager {
 	///
 	/// Also returns an event [Listener] that should be registred as a
 	/// listener with the [P2P].
-	pub fn start<A, R>(
+	pub fn start(
 		config: Config,
-		add_peer: A,
-		remove_peer: R,
-	) -> Result<(ConnectionManager, ConnMgrListener), io::Error>
-	where
-		A: FnMut(mio::net::TcpStream, PeerType) -> Result<PeerId, crate::Error> + Send + 'static,
-		R: FnMut(PeerId) -> Result<(), crate::Error> + Send + 'static,
-	{
+		add_peer: Box<AddPeerFn>,
+        thread: &ProcessorThread,
+	) -> Result<(ConnectionManager, ConnMgrListener), ProcessorThreadError> {
 		let (ctrl_tx, ctrl_rx) = mpsc::channel();
 		let (event_tx, event_rx) = mpsc::channel();
 
@@ -130,25 +125,18 @@ impl ConnectionManager {
             listeners: HashSet::new(),
         }));
 
-		let rt = Runtime {
+		let ctrl_tx = WakerSender::new(ctrl_tx, thread.waker()?);
+		let event_tx = WakerSender::new(event_tx, thread.waker()?);
+
+		let proc = Processor {
             data: data.clone(),
             ctrl_rx: ctrl_rx,
             event_rx: event_rx,
-
-            // Here we'll keep all our TCP listeners.
-            // Just keep a vector as we don't expect this to be big.
-            listener_id_counter: 0,
+            tcp_listener_id_counter: 0,
             listeners: Vec::new(),
-            
-            // Closures to add and remove peers.
-            add_peer_fn: Box::new(add_peer),
-            remove_peer_fn: Box::new(remove_peer),
+            add_peer_fn: add_peer,
         };
-
-        let registry = run_processor_thread("bitcoin_p2p_connmgr_thread".into(), rt)?;
-
-		let ctrl_tx = WakerSender::new(ctrl_tx, mio::Waker::new(&registry, WAKE_TOKEN)?);
-		let event_tx = WakerSender::new(event_tx, mio::Waker::new(&registry, WAKE_TOKEN)?);
+        thread.add_processor(Box::new(proc))?;
 
 		let mgr = ConnectionManager {
             data: data,
@@ -159,7 +147,7 @@ impl ConnectionManager {
 		Ok((mgr, ConnMgrListener(event_tx)))
 	}
 
-    /// The set of listeners we are listening on.
+    /// The set of 
     pub fn listeners(&self) -> HashSet<net::SocketAddr> {
         self.data.lock().unwrap().listeners.clone()
     }
@@ -190,68 +178,11 @@ impl ConnectionManager {
 	}
 }
 
-#[derive(Clone, Copy)]
-pub enum Token {
-    ConnMgr(usize),
-}
-
-impl Into<mio::Token> for Token {
-    fn into(self) -> mio::Token {
-        //TODO(stevenroose) 
-        mio::Token(0)
-    }
-}
-
-pub trait ThreadedRuntime: Send + 'static {
-    //TODO(stevenroose) make custom event type
-    fn wakeup(&mut self, registry: &mio::Registry, events: &mio::Events);
-}
-
-pub fn run_processor_thread<R: ThreadedRuntime>(
-    name: String,
-    mut rt: R,
-) -> Result<mio::Registry, io::Error> {
-    let mut poll = mio::Poll::new()?;
-    let registry = poll.registry().try_clone()?;
-    thread::Builder::new().name(name).spawn(move || {
-		info!("ConnectionManager thread started");
-
-        // Setup the required mio types.
-		let mut events = mio::Events::with_capacity(1024);
-		
-		loop {
-			events.clear();
-
-            //TODO(stevenroose) timeout
-			poll.poll(&mut events, None).expect("poll error");
-
-            rt.wakeup(poll.registry(), &events);
-		}
-    })?;
-    Ok(registry)
-}
-
 enum Ctrl {
 	/// Add a new TCP listener.
 	AddListener(net::SocketAddr, mio::net::TcpListener),
 	/// Remove a TCP listener.
 	RemoveListener(net::SocketAddr),
-}
-
-struct Runtime {
-    data: Arc<Mutex<Data>>,
-
-	ctrl_rx: mpsc::Receiver<Ctrl>,
-	event_rx: mpsc::Receiver<Event>,
-
-    // Here we'll keep all our TCP listeners.
-    // Just keep a vector as we don't expect this to be big.
-    listener_id_counter: usize,
-    listeners: Vec::<Listener>,
-	
-	// Closures to add and remove peers.
-	add_peer_fn: Box<AddPeerFn>,
-	remove_peer_fn: Box<RemovePeerFn>,
 }
 
 struct Listener {
@@ -260,24 +191,33 @@ struct Listener {
 	listener: mio::net::TcpListener,
 }
 
-impl Runtime {
-	fn add_peer(&mut self, addr: net::SocketAddr, stream: mio::net::TcpStream, tp: PeerType) {
-		let id = match (*self.add_peer_fn)(stream, tp) {
-			Ok(id) => id,
-			Err(e) => {
-				warn!("Error adding peer with address {}: {}", addr, e);
-				return;
-			}
-		};
+struct Processor {
+    data: Arc<Mutex<Data>>,
 
-		let info = PeerInfo {
-			addr: addr,
-			peer_type: tp,
-			handshake: false,
-		};
-		if let Some(dup) = self.data.lock().unwrap().connected.insert(id, info) {
-			error!("Duplicate peer ID {}: {} and {}", id, dup.addr, addr);
-		}
+	ctrl_rx: mpsc::Receiver<Ctrl>,
+	event_rx: mpsc::Receiver<Event>,
+
+    // Here we'll keep all our TCP listeners.
+    // Just keep a vector as we don't expect this to be big.
+    tcp_listener_id_counter: usize,
+    listeners: Vec::<Listener>,
+	
+	// Closures to add and remove peers.
+	add_peer_fn: Box<AddPeerFn>,
+}
+
+impl Processor {
+	fn add_peer(&mut self, addr: net::SocketAddr, stream: mio::net::TcpStream, tp: PeerType) {
+		if let Some(id) = (*self.add_peer_fn)(stream, tp) {
+            let info = PeerInfo {
+                addr: addr,
+                peer_type: tp,
+                handshake: false,
+            };
+            if let Some(dup) = self.data.lock().unwrap().connected.insert(id, info) {
+                error!("Duplicate peer ID {}: {} and {}", id, dup.addr, addr);
+            }
+        }
 	}
 
 	fn peer_connected(&mut self, peer: PeerId) {
@@ -299,17 +239,17 @@ impl Runtime {
 	}
 }
 
-impl ThreadedRuntime for Runtime {
-	fn wakeup(&mut self, registry: &mio::Registry, events: &mio::Events) {
+impl IoProcessor for Processor {
+	fn wakeup(&mut self, tt: &TokenTally, rg: &mio::Registry, ev: &mio::Events) {
         trace!("ConnectionManager runtime called");
 
         while let Ok(ctrl) = self.ctrl_rx.try_recv() {
             match ctrl {
                 Ctrl::AddListener(addr, mut list) => {
-                    self.listener_id_counter += 1;
+                    self.tcp_listener_id_counter += 1;
 
-                    let token = mio::Token(self.listener_id_counter);
-                    registry.register(&mut list, token, mio::Interest::READABLE)
+                    let token = tt.next();
+                    rg.register(&mut list, token.into(), mio::Interest::READABLE)
                         .expect("TCP listener poll registry failed");
 
                     // Check for duplicates.
@@ -349,7 +289,7 @@ impl ThreadedRuntime for Runtime {
         // borrowck workaround
         let mut new_peers = Vec::new();
         'events:
-        for event in events.iter().filter(|e| e.token() != WAKE_TOKEN) {
+        for event in ev.iter().filter(|e| e.token() != WAKE_TOKEN) {
             let list = or!(self.listeners.iter_mut().find(|l| l.token == event.token()), continue);
             let addr = list.addr;
 
