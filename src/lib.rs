@@ -1,4 +1,4 @@
-#![deny(unused)]
+// #![deny(unused)]
 
 #[macro_use]
 extern crate log;
@@ -19,7 +19,7 @@ mod processor;
 pub use config::Config;
 pub use error::Error;
 
-use std::{fmt, io, net, thread};
+use std::{fmt, io, net};
 use std::collections::HashMap;
 use std::sync::{atomic, mpsc, Arc, Mutex};
 
@@ -27,8 +27,8 @@ use bitcoin::network::message::NetworkMessage;
 use bitcoin::network::message_blockdata::Inventory;
 use bitcoin::network::message_network::VersionMessage;
 
-use processor::Ctrl;
-use mio_io::WakerSender;
+use processor::{Processor, Ctrl};
+use mio_io::{ProcessorThread, ProcessorThreadError, WakerSender};
 
 /// The return type of the [Listener::event] method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,35 +178,51 @@ pub struct P2P {
 	block_height: atomic::AtomicU32,
 }
 
+        // let data = Arc::new(Mutex::new(Data {
+			// connected: HashMap::new(),
+			// disconnected: LruCache::new(config.disconnected_peers_cache_size),
+        //     listeners: HashSet::new(),
+        // }));
+
+		// let (ctrl_tx, ctrl_rx) = mpsc::channel();
+		// let (event_tx, event_rx) = mpsc::channel();
+		// let ctrl_tx = WakerSender::new(ctrl_tx, thread.waker()?);
+		// let event_tx = WakerSender::new(event_tx, thread.waker()?);
+
+		// let proc = Processor {
+        //     data: data.clone(),
+        //     ctrl_rx: ctrl_rx,
+        //     event_rx: event_rx,
+        //     tcp_listener_id_counter: 0,
+        //     listeners: Vec::new(),
+        //     add_peer_fn: add_peer,
+        // };
+        // thread.add_processor(Box::new(proc))?;
+
+		// let mgr = ConnectionManager {
+        //     data: data,
+			// ctrl_tx: ctrl_tx,
+			// config: config,
+		// };
 impl P2P {
 	/// Instantiate a P2P coordinator.
-	pub fn new(config: Config) -> Arc<P2P> {
-		let p2p = Arc::new(P2P {
+	pub fn new(config: Config) -> Result<P2P, ProcessorThreadError> {
+		// Create the control message channel.
+		let (ctrl_tx, ctrl_rx) = mpsc::channel();
+
+		let proc = Processor::new(config.clone(), ctrl_rx);
+        let thread = ProcessorThread::new(format!("p2p_{}", config.network))?;
+        thread.add_processor(Box::new(proc))?;
+        //TODO(stevenroose) use thread
+
+		Ok(P2P {
 			config: config,
 			next_peer_id: atomic::AtomicUsize::new(1),
 			peers: Mutex::new(HashMap::new()),
 			ctrl_tx: Mutex::new(None),
 			block_height: atomic::AtomicU32::new(0),
-		});
-
-		p2p
+		})
 	}
-
-    pub fn start(self: &Arc<Self>) -> Result<(), Error> {
-		// Create the control message channel.
-		let (ctrl_tx, ctrl_rx) = mpsc::channel();
-
-		// Create the processor thread and receive the waker.
-        let self_handle = self.clone();
-		let (processor, waker) = processor::Thread::new(self_handle, ctrl_rx)?;
-        *self.ctrl_tx.lock().unwrap() = Some(WakerSender::new(ctrl_tx, waker));
-
-        //TODO(stevenroose) keep the joinhandle?
-		let _ = thread::Builder::new()
-			.name("bitcoin_p2p_thread".into())
-			.spawn(|| processor.run())?;
-        Ok(())
-    }
 
 	/// Get the configuration of the P2P instance.
 	pub fn config(&self) -> &Config {

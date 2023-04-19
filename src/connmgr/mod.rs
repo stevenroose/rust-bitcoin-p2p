@@ -9,9 +9,8 @@ use lru::LruCache;
 use crate::{Event, ListenerResult, PeerId, PeerType};
 use crate::mio_io::{
     IoProcessor, ProcessorThread, ProcessorThreadError, TokenTally, WakerSender, WakerSenderError,
+    WAKE_TOKEN,
 };
-
-const WAKE_TOKEN: mio::Token = mio::Token(0);
 
 /// Connection manager related errors.
 #[derive(Debug)]
@@ -107,24 +106,21 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-	/// Create a new [ConnectionManager] that starts upon creation.
-	///
-	/// Also returns an event [Listener] that should be registred as a
-	/// listener with the [P2P].
-	pub fn start(
+	/// Create a new [ConnectionManager] that starts inside the given
+    /// [ProcessorThread] upon creation.
+	pub fn start_in(
+        thread: &ProcessorThread,
 		config: Config,
 		add_peer: Box<AddPeerFn>,
-        thread: &ProcessorThread,
 	) -> Result<(ConnectionManager, ConnMgrListener), ProcessorThreadError> {
-		let (ctrl_tx, ctrl_rx) = mpsc::channel();
-		let (event_tx, event_rx) = mpsc::channel();
-
         let data = Arc::new(Mutex::new(Data {
 			connected: HashMap::new(),
 			disconnected: LruCache::new(config.disconnected_peers_cache_size),
             listeners: HashSet::new(),
         }));
 
+		let (ctrl_tx, ctrl_rx) = mpsc::channel();
+		let (event_tx, event_rx) = mpsc::channel();
 		let ctrl_tx = WakerSender::new(ctrl_tx, thread.waker()?);
 		let event_tx = WakerSender::new(event_tx, thread.waker()?);
 
