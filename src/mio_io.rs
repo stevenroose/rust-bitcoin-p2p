@@ -9,47 +9,47 @@ pub const WAKE_TOKEN: mio::Token = mio::Token(0);
 /// An error from calling the [WakerSender::send] method.
 #[derive(Debug)]
 pub enum WakerSenderError<T> {
-	/// An error sending on the sender.
-	Send(mpsc::SendError<T>),
-	/// An error waking up the waker.
-	Wake(io::Error),
+        /// An error sending on the sender.
+        Send(mpsc::SendError<T>),
+        /// An error waking up the waker.
+        Wake(io::Error),
 }
 
 /// A wrapper of an [mpsc::Sender] with a `mio` waker so that a thread can be
 /// woken up when an item is sent on the channel.
 #[derive(Debug)]
 pub struct WakerSender<T> {
-	sender: mpsc::Sender<T>,
-	waker: mio::Waker,
+        sender: mpsc::Sender<T>,
+        waker: mio::Waker,
 }
 
 impl<T> WakerSender<T> {
-	/// Create a new [WakerSender].
-	pub fn new(sender: mpsc::Sender<T>, waker: mio::Waker) -> WakerSender<T> {
-		WakerSender {
-			sender: sender,
-			waker: waker,
-		}
-	}
+        /// Create a new [WakerSender].
+        pub fn new(sender: mpsc::Sender<T>, waker: mio::Waker) -> WakerSender<T> {
+                WakerSender {
+                        sender: sender,
+                        waker: waker,
+                }
+        }
 
-	/// Send on the channel.
-	pub fn send(&self, item: T) -> Result<(), WakerSenderError<T>> {
-		self.sender.send(item).map_err(WakerSenderError::Send)?;
-		self.waker.wake().map_err(WakerSenderError::Wake)?;
-		Ok(())
-	}
+        /// Send on the channel.
+        pub fn send(&self, item: T) -> Result<(), WakerSenderError<T>> {
+                self.sender.send(item).map_err(WakerSenderError::Send)?;
+                self.waker.wake().map_err(WakerSenderError::Wake)?;
+                Ok(())
+        }
 }
 
 impl crate::Listener for WakerSender<crate::Event> {
-	fn event(&mut self, event: &crate::Event) -> crate::ListenerResult {
-		match self.send(event.clone()) {
-			Ok(()) => crate::ListenerResult::Ok,
-			// The channel disconnected.
-			Err(WakerSenderError::Send(_)) => crate::ListenerResult::RemoveMe,
-			// The waker has I/O problems, the mio::Poll might no longer exist.
-			Err(WakerSenderError::Wake(_)) => crate::ListenerResult::RemoveMe,
-		}
-	}
+        fn event(&mut self, event: &crate::Event) -> crate::ListenerResult {
+                match self.send(event.clone()) {
+                        Ok(()) => crate::ListenerResult::Ok,
+                        // The channel disconnected.
+                        Err(WakerSenderError::Send(_)) => crate::ListenerResult::RemoveMe,
+                        // The waker has I/O problems, the mio::Poll might no longer exist.
+                        Err(WakerSenderError::Wake(_)) => crate::ListenerResult::RemoveMe,
+                }
+        }
 }
 
 //TODO(stevenroose) need atomic?
@@ -85,7 +85,7 @@ pub trait IoProcessor: Send + 'static {
 
 pub enum ProcessorThreadError {
     AlreadyShutdown,
-	Io(io::Error),
+        Io(io::Error),
     Other(String),
 }
 

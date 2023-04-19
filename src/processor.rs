@@ -241,56 +241,56 @@ impl Processor {
         //TODO(stevenroose) put these elsewhere
 
 		// if let NetworkMessage::Version(ver) = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	logic::handshake::handle_version(&mut self.react, &self.p2p, peer, state, ver);
-		// 	if state.handshake.finished() {
-		// 		drop(state);
-		// 		drop(peers_lock);
-		// 		self.dispatch(Event::Connected(peer));
-		// 	}
-		// 	return;
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	logic::handshake::handle_version(&mut self.react, &self.p2p, peer, state, ver);
+		//	if state.handshake.finished() {
+		//		drop(state);
+		//		drop(peers_lock);
+		//		self.dispatch(Event::Connected(peer));
+		//	}
+		//	return;
 		// }
 
 		// if let NetworkMessage::Verack = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	// Store verack info and schedule first ping.
-		// 	logic::handshake::handle_verack(&mut self.react, &self.config, peer, state);
-		// 	if state.handshake.finished() {
-		// 		drop(state);
-		// 		drop(peers_lock);
-		// 		self.dispatch(Event::Connected(peer));
-		// 	}
-		// 	return;
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	// Store verack info and schedule first ping.
+		//	logic::handshake::handle_verack(&mut self.react, &self.config, peer, state);
+		//	if state.handshake.finished() {
+		//		drop(state);
+		//		drop(peers_lock);
+		//		self.dispatch(Event::Connected(peer));
+		//	}
+		//	return;
 		// }
 
 		// if let NetworkMessage::Ping(nonce) = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	logic::pingpong::handle_ping(&mut self.react, peer, state, nonce);
-		// 	return;
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	logic::pingpong::handle_ping(&mut self.react, peer, state, nonce);
+		//	return;
 		// }
 
 		// if let NetworkMessage::Pong(nonce) = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	logic::pingpong::handle_pong(&mut self.react, peer, state, nonce);
-		// 	return;
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	logic::pingpong::handle_pong(&mut self.react, peer, state, nonce);
+		//	return;
 		// }
 
 		// if let NetworkMessage::SendHeaders = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	state.send_headers = true;
-		// 	return;
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	state.send_headers = true;
+		//	return;
 		// }
 
 		// if let NetworkMessage::Inv(ref items) = msg {
-		// 	let mut peers_lock = self.p2p.peers.lock().unwrap();
-		// 	let state = or!(peers_lock.get_mut(&peer), return);
-		// 	logic::inventory::handle_inv(state, items);
-		// 	// don't return but pass the message to the user
+		//	let mut peers_lock = self.p2p.peers.lock().unwrap();
+		//	let state = or!(peers_lock.get_mut(&peer), return);
+		//	logic::inventory::handle_inv(state, items);
+		//	// don't return but pass the message to the user
 		// }
 
 		// self.dispatch(Event::Message(peer, msg));

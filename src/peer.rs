@@ -344,55 +344,55 @@ impl Peer {
 	}
 
 	// pub fn recv_msg(&self) -> Result<Option<NetworkMessage>, Error> {
-	// 	let mut queue = self.inbound_msgs.lock().unwrap();
-	// 	if let Some(msg) = queue.pop_front() {
-	// 		// Wake the message handler to process next message.
-	// 		if !queue.is_empty() {
-	// 			self.message_handler_waker.wake()?;
-	// 		}
-	// 		Ok(Some(msg))
-	// 	} else {
-	// 		Ok(None)
-	// 	}
+	//	let mut queue = self.inbound_msgs.lock().unwrap();
+	//	if let Some(msg) = queue.pop_front() {
+	//		// Wake the message handler to process next message.
+	//		if !queue.is_empty() {
+	//			self.message_handler_waker.wake()?;
+	//		}
+	//		Ok(Some(msg))
+	//	} else {
+	//		Ok(None)
+	//	}
 	// }
 
 	// pub fn wait_recv_msg(&self, timeout: Duration) -> Result<NetworkMessage, Error> {
-	// 	let start = SystemTime::now();
-	// 	let mut queue = self.inbound_msgs.lock().unwrap();
-	// 	if let Some(msg) = queue.pop_front() {
-	// 		// Wake the message handler to process next message.
-	// 		if !queue.is_empty() {
-	// 			self.message_handler_waker.wake()?;
-	// 		}
-	// 		return Ok(msg);
-	// 	}
-	// 	let time_passed = SystemTime::now().duration_since(start).unwrap();
-	// 	let timeout_left = match timeout.checked_sub(time_passed) {
-	// 		Some(t) => t,
-	// 		None => return Err(Error::TimedOut),
-	// 	};
-	// 	let (mut queue, result) = self.inbound_notify.wait_timeout(queue, timeout_left).unwrap();
-	// 	if result.timed_out() {
-	// 		return Err(Error::TimedOut);
-	// 	}
-	// 	// The only scenario where the Condvar is notified without any new
-	// 	// messages in the queue is when the peer is disconnected.
-	// 	match queue.pop_front() {
-	// 		Some(m) => {
-	// 			// Wake the message handler to process next message.
-	// 			if !queue.is_empty() {
-	// 				self.message_handler_waker.wake()?;
-	// 			}
-	// 			Ok(m)
-	// 		}
-	// 		None => {
-	// 			if !self.connected() {
-	// 				Err(Error::Disconnected)
-	// 			} else {
-	// 				panic!("severe error: mutex condvar released with empty queue");
-	// 			}
-	// 		}
-	// 	}
+	//	let start = SystemTime::now();
+	//	let mut queue = self.inbound_msgs.lock().unwrap();
+	//	if let Some(msg) = queue.pop_front() {
+	//		// Wake the message handler to process next message.
+	//		if !queue.is_empty() {
+	//			self.message_handler_waker.wake()?;
+	//		}
+	//		return Ok(msg);
+	//	}
+	//	let time_passed = SystemTime::now().duration_since(start).unwrap();
+	//	let timeout_left = match timeout.checked_sub(time_passed) {
+	//		Some(t) => t,
+	//		None => return Err(Error::TimedOut),
+	//	};
+	//	let (mut queue, result) = self.inbound_notify.wait_timeout(queue, timeout_left).unwrap();
+	//	if result.timed_out() {
+	//		return Err(Error::TimedOut);
+	//	}
+	//	// The only scenario where the Condvar is notified without any new
+	//	// messages in the queue is when the peer is disconnected.
+	//	match queue.pop_front() {
+	//		Some(m) => {
+	//			// Wake the message handler to process next message.
+	//			if !queue.is_empty() {
+	//				self.message_handler_waker.wake()?;
+	//			}
+	//			Ok(m)
+	//		}
+	//		None => {
+	//			if !self.connected() {
+	//				Err(Error::Disconnected)
+	//			} else {
+	//				panic!("severe error: mutex condvar released with empty queue");
+	//			}
+	//		}
+	//	}
 	// }
 
 	/// Return true if the item was already known.

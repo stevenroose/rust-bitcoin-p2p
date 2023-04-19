@@ -9,12 +9,13 @@ mod utils;
 pub mod constants;
 pub mod connmgr;
 
-mod mio_io;
-
 mod config;
 mod error;
 mod logic;
 mod processor;
+mod scheduler;
+
+mod mio_io;
 
 pub use config::Config;
 pub use error::Error;
@@ -176,34 +177,12 @@ pub struct P2P {
 
 	/// The current block height of our client to advertise to peers.
 	block_height: atomic::AtomicU32,
+
+    /// The thread we are running in. This can be [None] if the user wants
+    /// to manually manage their threads.
+    thread: Option<ProcessorThread>,
 }
 
-        // let data = Arc::new(Mutex::new(Data {
-			// connected: HashMap::new(),
-			// disconnected: LruCache::new(config.disconnected_peers_cache_size),
-        //     listeners: HashSet::new(),
-        // }));
-
-		// let (ctrl_tx, ctrl_rx) = mpsc::channel();
-		// let (event_tx, event_rx) = mpsc::channel();
-		// let ctrl_tx = WakerSender::new(ctrl_tx, thread.waker()?);
-		// let event_tx = WakerSender::new(event_tx, thread.waker()?);
-
-		// let proc = Processor {
-        //     data: data.clone(),
-        //     ctrl_rx: ctrl_rx,
-        //     event_rx: event_rx,
-        //     tcp_listener_id_counter: 0,
-        //     listeners: Vec::new(),
-        //     add_peer_fn: add_peer,
-        // };
-        // thread.add_processor(Box::new(proc))?;
-
-		// let mgr = ConnectionManager {
-        //     data: data,
-			// ctrl_tx: ctrl_tx,
-			// config: config,
-		// };
 impl P2P {
 	/// Instantiate a P2P coordinator.
 	pub fn new(config: Config) -> Result<P2P, ProcessorThreadError> {
@@ -213,7 +192,6 @@ impl P2P {
 		let proc = Processor::new(config.clone(), ctrl_rx);
         let thread = ProcessorThread::new(format!("p2p_{}", config.network))?;
         thread.add_processor(Box::new(proc))?;
-        //TODO(stevenroose) use thread
 
 		Ok(P2P {
 			config: config,
@@ -221,6 +199,7 @@ impl P2P {
 			peers: Mutex::new(HashMap::new()),
 			ctrl_tx: Mutex::new(None),
 			block_height: atomic::AtomicU32::new(0),
+            thread: Some(thread),
 		})
 	}
 
@@ -396,7 +375,7 @@ impl P2P {
 		self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
 	}
 	// pub fn add_listener_function(&self, listener: impl for<'e> FnMut(&'e Event) -> bool + Send + 'static) -> Result<(), Error> {
-	// 	self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
+	//	self.send_ctrl(Ctrl::AddListener(Box::new(listener)))
 	// }
 
 	/// Create a new [std::mpsc::channel] and register it as a listener.
