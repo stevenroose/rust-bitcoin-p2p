@@ -1,493 +1,404 @@
-use std::borrow::Cow;
-use std::collections::LinkedList;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
-use std::{cmp, fmt};
 
-use bitcoin::hashes::sha256d;
-use bitcoin::network::message::{CommandString, NetworkMessage};
-use bitcoin::network::message_blockdata::{InvType, Inventory};
-use bitcoin::network::message_network::{Reject, RejectReason, VersionMessage};
-use lru::LruCache;
+use std::{fmt, io, net};
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{self, AtomicU32};
+use std::time::Duration;
 
-#[cfg(feature = "crossbeam-channel")]
-use crossbeam_channel::Sender;
-#[cfg(not(feature = "crossbeam-channel"))]
-use std::sync::mpsc::{Sender, SyncSender};
+use bitcoin;
+// use bitcoin::network::constants::Magic;
+use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::consensus::encode;
+use crossbeam_channel as chan;
+use erin;
 
-use crate::constants;
-use crate::error::Error;
-use crate::channel;
+use crate::{DisconnectReason, Error, PeerId};
+use crate::events::{Dispatch, EventSource, Listener};
 
-use crate::message_handler::PeerInventory;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum TokenType {
-	Disconnect,
-	MsgIn,
-	MsgOut,
-	NetworkIo,
-	NetworkWaker,
-}
-
-const NB_TOKEN_TYPES: usize = 5;
-
-/// A peer identifier.
-///
-/// Can never be 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PeerId(usize);
-
-impl PeerId {
-	pub(crate) fn new(id: usize) -> PeerId {
-		assert_ne!(id, 0);
-		assert!(id < usize::max_value() / NB_TOKEN_TYPES, "too many peers!");
-		PeerId(id)
-	}
-
-	pub(crate) fn from_token(token: mio::Token) -> (PeerId, TokenType) {
-		assert_ne!(token, ::WAKE_TOKEN);
-		(
-			PeerId::new(token.0 / NB_TOKEN_TYPES),
-			match token.0 % NB_TOKEN_TYPES {
-				0 => TokenType::Disconnect,
-				1 => TokenType::MsgIn,
-				2 => TokenType::MsgOut,
-				3 => TokenType::NetworkIo,
-				4 => TokenType::NetworkWaker,
-				_ => unreachable!(),
-			},
-		)
-	}
-
-	pub(crate) fn token(&self, token_type: TokenType) -> mio::Token {
-		mio::Token(
-			self.0 * NB_TOKEN_TYPES
-				+ match token_type {
-					TokenType::Disconnect => 0,
-					TokenType::MsgIn => 1,
-					TokenType::MsgOut => 2,
-					TokenType::NetworkIo => 3,
-					TokenType::NetworkWaker => 4,
-				},
-		)
-	}
-}
-
-impl fmt::Display for PeerId {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(&self.0, f)
-	}
-}
-
-pub type OnMessageCallback = fn(Arc<Peer>, NetworkMessage);
-
-/// Specifies the way incoming messages are delivered to the user.
-/// System messages like pings and handshake messages are not delivered
-/// unless the peer config instructs so.
-#[derive(Debug, Clone)]
-pub enum MessageDelivery {
-	/// Discard all non-system messages.
-	Discard,
-	/// Callback that will be called for all incoming messages.
-	/// This callback is called from a single processing thread, which means:
-	/// - Only a single callback can be called across all [Peer]s from the same
-	///   [PeerManager].
-	/// - As long as this method doesn't return, no other messages
-	///   can be processed.
-	Callback(OnMessageCallback),
-	/// Push all messages into this channel.
-	/// Messages are pushed from a single processing thread, which means:
-	/// - Only a single send can be performed across all [Peer]s from the same
-	///   [PeerManager].
-	/// - As long as this channel can't accept the message, no other messages
-	///   can be sent.
-	#[cfg(feature = "crossbeam-channel")]
-	Channel(Sender<NetworkMessage>),
-	#[cfg(not(feature = "crossbeam-channel"))]
-	Channel(Arc<Mutex<Sender<NetworkMessage>>>),
-	/// See [Channel].
-	#[cfg(not(feature = "crossbeam-channel"))]
-	SyncChannel(SyncSender<NetworkMessage>),
-}
 
 #[derive(Debug, Clone)]
-pub struct PeerConfig {
-	/// Bitcoin network this peer is connected with.
-	///
-	/// Default value: mainnet.
-	pub network: bitcoin::Network,
+pub struct Config {
+	/// The magic value for the network.
+	pub magic: u32,
 
-	/// Specify how messages should be delivered.
-	pub delivery: MessageDelivery,
+	/// The maximum size of the output buffer we maintain.
+	/// Buffers initialize size 0 but will be shrunk to this
+	/// size when they grow over it.
+	///
+	/// Default value: 4 MiB.
+	pub stream_out_buf_size_limit: usize,
 
-	/// Protocol version to announce to peers.
+	/// The maximum size of the input buffer we maintain.
+	/// Buffers initialize size 0 but will be shrunk to this
+	/// size when they grow over it.
 	///
-	/// Default value: 70012.
-	pub protocol_version: u32,
-	/// Service flags to announce to peers.
-	///
-	/// Default value: 0.
-	pub services: u64,
-	/// Whether or not to request peers to relay transactions.
-	///
-	/// Default value: true.
-	pub relay: bool,
-
-	/// Set this to not handle the handshake so the user can handle it manually.
-	///
-	/// Default value: false.
-	//TODO(stevenroose) add testing for this
-	pub manual_handshake: bool,
-	/// Set this to not handle ping messages so the user can handle them manually.
-	///
-	/// Default value: false.
-	//TODO(stevenroose) add testing for this
-	pub manual_pingpong: bool,
-
-	/// The interval at which to trickle data to peers.
-	///
-	/// Default value: 10 seconds.
-	pub trickle_interval: Duration,
-
-	/// The interval at which to ping the peer.
-	///
-	/// Default value: 2 minutes.
-	pub ping_interval: Duration,
-
-	/// The maximum size of the known inventory to keep for this peer.
-	pub max_inventory_size: usize,
+	/// Default value: 4 MiB.
+	pub stream_in_buf_size_limit: usize,
 }
 
-impl Default for PeerConfig {
-	fn default() -> Self {
-		PeerConfig {
-			network: bitcoin::Network::Bitcoin,
-			delivery: MessageDelivery::Discard,
-			protocol_version: 70012,
-			services: 0,
-			relay: true,
-			manual_handshake: false,
-			manual_pingpong: false,
-			trickle_interval: Duration::from_secs(10),
-			ping_interval: Duration::from_secs(2 * 60),
-			max_inventory_size: 1000,
+impl Default for Config {
+	fn default() -> Config {
+		Config {
+			magic: 0, //TODO(stevenroose) bitcoin::network::constant::Magic::BITCOIN,
+			stream_out_buf_size_limit: 4 * 1024 * 1024,
+			stream_in_buf_size_limit: 4 * 1024 * 1024,
 		}
 	}
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub enum PeerType {
-	Inbound,
-	Outbound,
+#[derive(Clone, Debug)]
+pub enum Event {
+	Connected,
+	//TODO(stevenroose) should this be an arc to avoid cloning 4MB blocks?
+	//  arguably, our internal listeners won't clone this because we do filtering
+	//  before sending on a channel, but users might use simple channels as listeners
+	Message(NetworkMessage),
+	Disconnected(DisconnectReason),
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct HandshakeStatus {
-	pub received_version: bool,
-	pub received_verack: bool,
-	pub protocol_version: u32,
-	pub version_msg: Option<VersionMessage>,
-}
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct PeerInfo {
-	pub id: PeerId,
-	pub addr: SocketAddr,
-	pub local_addr: SocketAddr,
-	pub peer_type: PeerType,
-}
-
-impl fmt::Display for PeerInfo {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(
-			f,
-			"Peer(#{} {} {})",
-			self.id,
-			self.addr,
-			match self.peer_type {
-				PeerType::Inbound => "ib",
-				PeerType::Outbound => "ob",
-			}
-		)
-	}
-}
-
-//TODO(stevenroose) does it make sense to use an inner or so
-//to get rid of these pub(crate) mess?
 pub struct Peer {
-	// These fields can be public because users can never mutate Peers.
-	/// Public info about the [Peer].
-	pub info: PeerInfo,
-	/// Configuration of the [Peer].
-	pub config: PeerConfig,
-
-	/// Keep track of the connected status of the peer.
-	pub(crate) connected: AtomicBool,
-
-	pub(crate) msg_tx: channel::SyncSender<NetworkMessage>,
-
-	/// Progress on the handshake progress.
-	//TODO(stevenroose) check that nothing can be done while not finished
-	//f.e. incoming messages
-	pub(crate) handshake: RwLock<HandshakeStatus>,
-	/// Ping/pong statistics.
-	/// Tuple of the last nonce and the last succesful ping timestamp.
-	pub(crate) ping_stats: Mutex<(u64, Instant)>,
-	/// If the peer wants header msgs instead of inventory vectors for blocks.
-	pub(crate) prefers_headers: AtomicBool,
-
-	pub(crate) network_handler_waker: mio::Waker,
-	pub(crate) message_handler_waker: mio::Waker,
-
-	inventory: Arc<RwLock<PeerInventory>>,
+	id: PeerId,
+	local_addr: net::SocketAddr,
+	ctrl_tx: chan::Sender<Ctrl>,
+	waker: erin::Waker,
+	pver: Arc<AtomicU32>,
 }
 
 impl Peer {
-	pub(crate) fn new(
-		info: PeerInfo,
-		config: PeerConfig,
-		msg_tx: channel::SyncSender<NetworkMessage>,
-		network_handler_waker: mio::Waker,
-		message_handler_waker: mio::Waker,
-		inventory: Arc<RwLock<PeerInventory>>,
-	) -> Result<Arc<Peer>, Error> {
-		Ok(Arc::new(Peer {
-			info: info,
-			connected: AtomicBool::new(true),
-			handshake: RwLock::new(HandshakeStatus::default()),
-			ping_stats: Mutex::new((0, Instant::now())),
-			prefers_headers: AtomicBool::new(false),
-			msg_tx: msg_tx,
-			network_handler_waker: network_handler_waker,
-			message_handler_waker: message_handler_waker,
-			config: config,
-			inventory: inventory,
-		}))
+	pub fn start_in(
+		rt: &erin::Runtime,
+		config: Config,
+		stream: net::TcpStream,
+	) -> Result<Peer, Error> {
+		let id = stream.peer_addr()?;
+		let local_addr = stream.local_addr()?;
+		let pver = Arc::new(AtomicU32::new(0));
+
+		let (ctrl_tx, ctrl_rx) = chan::unbounded();
+		let processor = Processor::new(config, id, stream, ctrl_rx);
+		let waker = rt.add_process(Box::new(processor))?.into_waker();
+
+		Ok(Peer { id, local_addr, ctrl_tx, waker, pver })
 	}
 
-	pub fn address(&self) -> SocketAddr {
-		self.info.addr
-	}
-
-	pub fn pending_handshake(&self) -> bool {
-		if self.config.manual_handshake {
-			return false;
-		}
-		let status = self.handshake.read().unwrap();
-		!status.received_version || !status.received_verack
-	}
-
-	/// Zero means not known yet.
-	pub fn protocol_version(&self) -> u32 {
-		self.handshake.read().unwrap().protocol_version
-	}
-
-	pub fn version_message(&self) -> Option<VersionMessage> {
-		//TODO(stevenroose) find a way to return a reference here
-		//as this getter might be used frequently
-		self.handshake.read().unwrap().version_msg.clone()
-	}
-
-	pub fn prefers_headers(&self) -> bool {
-		self.prefers_headers.load(AtomicOrdering::Acquire)
-	}
-
-	pub fn connected(&self) -> bool {
-		self.connected.load(AtomicOrdering::Acquire)
-	}
-
-	pub fn disconnect(&self) {
-		// First set connected to false so that any threads waking up ignore this peer.
-		if !self.connected.compare_and_swap(true, false, AtomicOrdering::Release) {
-			debug!("Called disconnect on {} while already disconnected", self);
-			return;
-		}
-
-		// Wake up the network handler who will close the TCP connection.
-		if let Err(e) = self.network_handler_waker.wake() {
-			error!("Error waking up network_handler while disconnecting peer {}: {}", self, e);
-		}
-
-		// Ultimately we wake up the message handler. This is so that it
-		// receives an event with this peer and it can remove it from the
-		// PeerManager's peer list.
-		if let Err(e) = self.message_handler_waker.wake() {
-			error!("Error waking up message_handler while disconnecting peer {}: {}", self, e);
-		}
-	}
-
-	fn ensure_can_send_safely(&self) -> Result<(), Error> {
-		if !self.connected() {
-			return Err(Error::Disconnected);
-		}
-		if self.pending_handshake() {
-			return Err(Error::HandshakePending);
-		}
-		Ok(())
-	}
-
-	pub fn send_msg(&self, msg: NetworkMessage) -> Result<(), Error> {
-		self.ensure_can_send_safely()?;
-		self.msg_tx.send(msg);
-		self.network_handler_waker.wake()?;
-		Ok(())
-	}
-
-	pub fn tru_send_msg(&self, msg: NetworkMessage) -> Result<(), Error> {
-		self.ensure_can_send_safely()?;
-		self.msg_tx.try_send(msg)?;
-		self.network_handler_waker.wake()?;
-		Ok(())
-	}
-
-	// pub fn recv_msg(&self) -> Result<Option<NetworkMessage>, Error> {
-	//	let mut queue = self.inbound_msgs.lock().unwrap();
-	//	if let Some(msg) = queue.pop_front() {
-	//		// Wake the message handler to process next message.
-	//		if !queue.is_empty() {
-	//			self.message_handler_waker.wake()?;
-	//		}
-	//		Ok(Some(msg))
-	//	} else {
-	//		Ok(None)
-	//	}
-	// }
-
-	// pub fn wait_recv_msg(&self, timeout: Duration) -> Result<NetworkMessage, Error> {
-	//	let start = SystemTime::now();
-	//	let mut queue = self.inbound_msgs.lock().unwrap();
-	//	if let Some(msg) = queue.pop_front() {
-	//		// Wake the message handler to process next message.
-	//		if !queue.is_empty() {
-	//			self.message_handler_waker.wake()?;
-	//		}
-	//		return Ok(msg);
-	//	}
-	//	let time_passed = SystemTime::now().duration_since(start).unwrap();
-	//	let timeout_left = match timeout.checked_sub(time_passed) {
-	//		Some(t) => t,
-	//		None => return Err(Error::TimedOut),
-	//	};
-	//	let (mut queue, result) = self.inbound_notify.wait_timeout(queue, timeout_left).unwrap();
-	//	if result.timed_out() {
-	//		return Err(Error::TimedOut);
-	//	}
-	//	// The only scenario where the Condvar is notified without any new
-	//	// messages in the queue is when the peer is disconnected.
-	//	match queue.pop_front() {
-	//		Some(m) => {
-	//			// Wake the message handler to process next message.
-	//			if !queue.is_empty() {
-	//				self.message_handler_waker.wake()?;
-	//			}
-	//			Ok(m)
-	//		}
-	//		None => {
-	//			if !self.connected() {
-	//				Err(Error::Disconnected)
-	//			} else {
-	//				panic!("severe error: mutex condvar released with empty queue");
-	//			}
-	//		}
-	//	}
-	// }
-
-	/// Return true if the item was already known.
-	pub fn add_known_inventory(&self, hash: sha256d::Hash) -> bool {
-		self.known_inventory.lock().unwrap().put(hash, ()).is_some()
-	}
-
-	pub fn send_inventory(&self, inv_type: InvType, hash: sha256d::Hash) -> Result<(), Error> {
-		self.ensure_can_send_safely()?;
-		if self.known_inventory.lock().unwrap().contains(&hash) {
-			trace!("Peer {} already knowns about {}, so we're not sending it", self, hash);
-		}
-
-		let inv = Inventory {
-			//TODO(stevenroose) no clone after https://github.com/rust-bitcoin/rust-bitcoin/pull/357
-			inv_type: inv_type.clone(),
-			hash: hash,
-		};
-
-		// If it's a block, we send it right away.
-		// Other inv types, we add to a queue to send later in bunch.
-		if inv_type == InvType::Block || inv_type == InvType::WitnessBlock {
-			self.send_msg(NetworkMessage::Inv(vec![inv]))?;
+	pub fn dial_in(
+		rt: &erin::Runtime,
+		config: Config,
+		addr: net::SocketAddr,
+		timeout: Option<Duration>,
+	) -> Result<Peer, Error> {
+		let stream = if let Some(to) = timeout {
+			net::TcpStream::connect_timeout(&addr, to)
 		} else {
-			self.inv_queue.lock().unwrap().push_back(inv);
-		}
-		Ok(())
+			net::TcpStream::connect(&addr)
+		}.map_err(Error::Dial)?;
+
+		Self::start_in(rt, config, stream)
 	}
 
-	pub fn send_reject_msg<R>(
-		&self,
-		command: CommandString,
-		reason_code: RejectReason,
-		reason: R,
-		hash: Option<sha256d::Hash>,
-	) -> Result<(), Error>
-	where
-		R: Into<Cow<'static, str>>,
-	{
-		if self.protocol_version() < constants::REJECT_VERSION {
-			//TODO(stevenroose) CommandString will implement display
-			debug!("Not sending '{}' reject message because protocol version is low", command.0);
-			return Ok(());
+	pub fn id(&self) -> PeerId {
+		self.id
+	}
+
+	pub fn addr(&self) -> net::SocketAddr {
+		self.id
+	}
+
+	pub fn local_addr(&self) -> net::SocketAddr {
+		self.local_addr
+	}
+
+	/// The protocol version of this peer.
+	///
+	/// This returns [None] before a protocol version has been negotiated.
+	pub fn version(&self) -> Option<u32> {
+		match self.pver.load(atomic::Ordering::Relaxed) {
+			0 => None,
+			v => Some(v),
 		}
+	}
 
-		//TODO(stevenroose) redo this after https://github.com/rust-bitcoin/rust-bitcoin/pull/357/
+	/// Set the peer's protocol version.
+	pub fn set_version(&self, protocol_version: u32) {
+		self.pver.store(protocol_version, atomic::Ordering::Relaxed);
+	}
 
-		//if command == CommandString("block".into()) || command == CommandString("tx".into()) {
-		//	if hash.is_none() {
-		//		warn!(
-		//			"Trying to send reject message for '{}' command without a hash specified.",
-		//			command
-		//		);
-		//	}
-		//}
+	pub fn listen(&self, listener: impl Listener<Event>) {
+		self.add_listener(Box::new(listener));
+	}
 
-		let msg = Reject {
-			message: command.0,
-			ccode: reason_code,
-			reason: reason.into().into_owned(),
-			hash: hash.unwrap_or_default(),
-		};
-		self.send_msg(NetworkMessage::Reject(msg))?;
-		Ok(())
+	/// Queue a network message to be sent to the peer.
+	pub fn send_message(&self, msg: impl Into<NetworkMessage>) {
+		self.send_ctrl(Ctrl::SendMsg(msg.into()));
+	}
+
+	/// Start disconnecting this peer for the specified reason.
+	pub fn disconnect_with_reason(&self, reason: DisconnectReason) {
+		self.send_ctrl(Ctrl::Disconnect(reason));
+	}
+
+	/// Start disconnecting this peer.
+	pub fn disconnect(&self) {
+		self.disconnect_with_reason(DisconnectReason::Command);
 	}
 }
 
-impl fmt::Display for Peer {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(&self.info, f)
+impl EventSource<Event> for Peer {
+	fn add_listener(&self, listener: Box<dyn Listener<Event>>) {
+		self.send_ctrl(Ctrl::AddListener(listener))
+	}
+}
+
+trait SendCtrl {
+	fn send_ctrl(&self, ctrl: Ctrl);
+}
+
+impl SendCtrl for Peer {
+	fn send_ctrl(&self, ctrl: Ctrl) {
+		//TODO(stevenroose) should we handle these errors?
+		let _ = self.ctrl_tx.send(ctrl);
+		//TODO(stevenroose) this is UnixStream::as_raw_fd erroring
+		let _ = self.waker.wake();
+	}
+}
+
+impl crate::Wire for Peer {
+	fn message(&self, msg: NetworkMessage) {
+		self.send_message(msg);
 	}
 }
 
 impl fmt::Debug for Peer {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		fmt::Display::fmt(self, f)
+		fmt::Display::fmt(&self.id, f)
 	}
 }
 
-impl cmp::PartialEq for Peer {
-	fn eq(&self, other: &Self) -> bool {
-		cmp::PartialEq::eq(&self.info.id, &other.info.id)
+enum Ctrl {
+	SendMsg(NetworkMessage),
+	AddListener(Box<dyn Listener<Event>>),
+	Disconnect(DisconnectReason),
+}
+
+struct Processor {
+	cfg: Config,
+	id: PeerId,
+
+	stream: net::TcpStream,
+	ctrl_rx: chan::Receiver<Ctrl>,
+	dispatch: Dispatch<Event>,
+
+	// some I/O local vars
+	token: erin::IoToken,
+	out_buf: Vec<u8>, //TODO(stevenroose) use Bytes
+	in_buf: Vec<u8>,
+	is_connected: bool,
+}
+
+impl Processor {
+	fn new(
+		config: Config,
+		id: PeerId,
+		stream: net::TcpStream,
+		ctrl_rx: chan::Receiver<Ctrl>,
+	) -> Processor {
+		Processor {
+			cfg: config,
+			id: id,
+			stream: stream,
+			ctrl_rx: ctrl_rx,
+			dispatch: Dispatch::new(),
+
+			token: erin::IoToken::NULL,
+			out_buf: Vec::new(),
+			in_buf: Vec::new(),
+			is_connected: false,
+		}
 	}
 }
 
-impl cmp::Eq for Peer {}
+impl Processor {
+	/// Send the message to the peer or add the message to the queue.
+	///
+	/// Returns true if there is more to send to the peer and false otherwise.
+	fn send_msg(&mut self, msg: NetworkMessage) -> Result<bool, DisconnectReason> {
+		let try_write = self.out_buf.is_empty();
 
-impl cmp::PartialOrd for Peer {
-	fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-		cmp::PartialOrd::partial_cmp(&self.info.id, &other.info.id)
+		let raw = RawNetworkMessage {
+			magic: self.cfg.magic,
+			payload: msg,
+		};
+		encode::Encodable::consensus_encode(&raw, &mut self.out_buf)
+			.expect("buffers don't error");
+
+		if self.is_connected && try_write {
+			self.try_write()
+		} else {
+			Ok(true)
+		}
+	}
+
+	fn disconnect(&mut self, reason: DisconnectReason) {
+		let _ = self.stream.shutdown(net::Shutdown::Both);
+		self.dispatch.dispatch(&Event::Disconnected(reason));
+	}
+
+	fn try_read(&mut self) -> Result<(), DisconnectReason> {
+		match self.stream.read(&mut self.in_buf) {
+			Ok(0) => {
+				let err = io::Error::new(io::ErrorKind::ConnectionReset, "peer disconnected");
+				Err(DisconnectReason::ConnectionError(Arc::new(err)))
+			}
+			Ok(_n) => {
+				let mut start = 0;
+				loop {
+					match encode::deserialize_partial::<RawNetworkMessage>(&self.in_buf[start..]) {
+						Ok((msg, end)) => {
+							if msg.magic != self.cfg.magic {
+								return Err(DisconnectReason::PeerMagic(msg.magic));
+							}
+							self.dispatch.dispatch(&Event::Message(msg.payload));
+							start += end;
+						}
+						Err(encode::Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+							break;
+						}
+						Err(e) => return Err(DisconnectReason::DecodeError(e.into())),
+					}
+				}
+
+				self.in_buf.copy_within(start.., 0);
+				self.in_buf.truncate(self.in_buf.len() - start);
+				self.in_buf.shrink_to(self.cfg.stream_in_buf_size_limit);
+				Ok(())
+			}
+			Err(_) if !self.is_connected => Err(DisconnectReason::ConnectionFailed),
+			Err(e) => Err(DisconnectReason::ConnectionError(e.into())),
+		}
+	}
+
+	/// Try to write to the socket.
+	///
+	/// Returns true if there is more to send to the peer and false otherwise.
+	fn try_write(&mut self) -> Result<bool, DisconnectReason> {
+		if self.out_buf.is_empty() {
+			return Ok(false);
+		}
+
+		match self.stream.write(&self.out_buf) {
+			Ok(0) => Ok(true),
+			Ok(n) => {
+				self.out_buf.copy_within(n.., 0);
+				self.out_buf.truncate(self.out_buf.len() - n);
+				self.out_buf.shrink_to(self.cfg.stream_out_buf_size_limit);
+				Ok(!self.out_buf.is_empty())
+			}
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock
+				|| e.kind() == io::ErrorKind::WriteZero =>
+			{
+				Ok(true)
+			}
+			Err(_) if !self.is_connected => Err(DisconnectReason::ConnectionFailed),
+			Err(e) => Err(DisconnectReason::ConnectionError(e.into())),
+		}
 	}
 }
 
-impl cmp::Ord for Peer {
-	fn cmp(&self, other: &Self) -> cmp::Ordering {
-		cmp::Ord::cmp(&self.info.id, &other.info.id)
+/// Read and write interest for erin.
+const RW: erin::Interest = erin::interest::READ | erin::interest::WRITE;
+
+impl erin::Process for Processor {
+	fn setup(&mut self, rt: &erin::RuntimeHandle) -> Result<(), erin::Exit> {
+		// Initially we register for WRITE because we are only really connected when
+		// we can write to the peer. We use this to send the connected event.
+		self.token = rt.register_io(&self.stream, RW);
+		Ok(())
+	}
+
+	fn wakeup(&mut self, rt: &erin::RuntimeHandle, ev: erin::Events) -> Result<(), erin::Exit> {
+		if ev.waker() {
+			loop {
+				match self.ctrl_rx.try_recv() {
+					Ok(Ctrl::SendMsg(msg)) => {
+						match self.send_msg(msg) {
+							Ok(true) => {
+								rt.reregister_io(self.token, RW);
+							}
+							Ok(false) => {},
+							Err(r) => {
+								self.disconnect(r);
+								return Err(erin::Exit);
+							}
+						}
+					}
+					Ok(Ctrl::AddListener(mut l)) => {
+						// To make sure some listeners don't stall waiting for
+						// a Connected event that already passed, we send it.
+						//TODO(stevenroose) does this have adverse effects?
+						if self.is_connected {
+							l.event(&Event::Connected);
+						}
+						self.dispatch.add_listener(l);
+					},
+					Ok(Ctrl::Disconnect(r)) => {
+						self.disconnect(r);
+						debug!("Peer processor shutting down: disconnected");
+						return Err(erin::Exit);
+					},
+					Err(chan::TryRecvError::Empty) => break,
+					Err(chan::TryRecvError::Disconnected) => {
+						debug!("Peer processor shutting down: ctrl channel closed");
+						return Err(erin::Exit);
+					}
+				}
+			}
+		}
+
+		for ev in ev.io() {
+			assert_eq!(ev.token, self.token, "only ever registered one token");
+
+			if ev.src.is_error() || ev.src.is_hangup() {
+				// Let the subsequent read fail.
+				trace!("{}: Socket error triggered: {:?}", self.id, ev);
+			}
+
+			if ev.src.is_readable() {
+				if let Err(r) = self.try_read() {
+					self.disconnect(r);
+					return Err(erin::Exit);
+				}
+			}
+			
+			if ev.src.is_writable() {
+				if !self.is_connected {
+					// We are only really connected once we get the first WRITE event.
+					self.dispatch.dispatch(&Event::Connected);
+					self.is_connected = true;
+				}
+
+				match self.try_write() {
+					Ok(true) => rt.reregister_io(self.token, RW),
+					Ok(false) => rt.reregister_io(self.token, erin::interest::READ),
+					Err(r) => {
+						self.disconnect(r);
+						return Err(erin::Exit);
+					}
+				}
+			}
+
+			if ev.src.is_invalid() {
+				// File descriptor was closed and is invalid.
+				// Nb. This shouldn't happen. It means the source wasn't
+				// properly unregistered, or there is a duplicate source.
+				error!("{}: Socket is invalid, shutting down", self.id);
+				return Err(erin::Exit);
+			}
+		}
+
+		Ok(())
+	}
+
+	fn shutdown(&mut self) {
+		self.disconnect(DisconnectReason::Command);
 	}
 }

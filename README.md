@@ -1,28 +1,40 @@
 
-bitcoin-p2p
-===========
 
 
-This is a Rust library implementation of the Bitcoin p2p protocol.
+# Some design decisions made
 
+## Components
 
-# Features
+The following components exist: 
 
-- [BIP 0014: Protocol Version and User Agent](https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki)
-- [BIP 0031: Pong Messages](https://github.com/bitcoin/bips/blob/master/bip-0031.mediawiki)
-- [BIP 0060: Fixed Length "version" Message (Relay-Transactions Field)](https://github.com/bitcoin/bips/blob/master/bip-0060.mediawiki)
-- [BIP 0130: sendheaders message](https://github.com/bitcoin/bips/blob/master/bip-0130.mediawiki)
-- [BIP 0144: Segregated Witness (Peer Services)](https://github.com/bitcoin/bips/blob/master/bip-0144.mediawiki)
+- `AddressManager`
+- `PeerManager`
+- `PingManager`
+- `Peer`
 
+Every component is structured as follows:
 
-## TODO
+### Public
 
-- peer banning
-- fee filters: https://github.com/bitcoin/bips/blob/master/bip-0133.mediawiki
-- reject peers that don't support segwit (ver 70013) (rust-bitcoin can't serialize without witness)
-- finish compact blocks support after https://github.com/rust-bitcoin/rust-bitcoin/pull/249
-- addrv2 https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki
-  https://github.com/rust-bitcoin/rust-bitcoin/pull/449
-- block filters
-- support WASM-threads with compile flags
+* There is a `Config` struct that contains all configuration options for the
+  manager.
+* There is a "handle" struct that has the components name.
+* Generally handles will be Arc'ed by the caller right after constructing.
+  (The `P2P` utility f.e. only exposes Arc'ed handles.)
+* Methods intended for internal use are exposed through a `XxxManagerControl`
+  trait.
 
+### Internal
+
+* There is a `Processor` struct that will live inside the runtime, so that
+  there is direct access to the internal fields without locks.
+* Communication from the handle to the processor happens over channels.
+* Sometimes we want to expose some data through the handle, this data
+  will unfortunately have to be stored in a shared `State` behind a lock.
+* Components can expose events through a `Dispatch` object stored in the
+  processor, users can listen by calling the `add_listener` methods on the
+  handles.
+* There is a private `SendCtrl` trait that is used to actually send `Ctrl`
+  messages. Usually it is implemented by the Manager itself and by the pair of
+  `(chan::Sender<Ctrl>, erin::Waker)`. So that event listeners can be
+  registered from within the processor without needing the manager's handle.

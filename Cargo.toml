@@ -1,26 +1,21 @@
 [package]
 name = "bitcoin-p2p"
-version = "0.0.2"
-authors = ["Steven Roose <steven@stevenroose.org>"]
-description = "Implementation of the Bitcoin p2p protocol."
-repository = "https://github.com/stevenroose/rust-bitcoin-p2p"
-license = "CC0-1.0"
-edition = "2018"
+version = "0.0.0"
+edition = "2021"
+
+[features]
+default = [ "serde" ]
+serde = [ "miniserde" ]
 
 [dependencies]
-bitcoin = "0.30.0"
-log = "0.4.8"
-rand = "0.8.0"
-rand_distr = "0.4.0"
+bitcoin = "0.29.2"
+crossbeam-channel = "0.5.6"
+erin = "0.1.0"
+evmap = "10.0"
+fastrand = "1.3.5"
+log = "0.4"
+parking_lot = "0.12.1"
+smallvec = "1.10.0"
 
-mio = { version = "0.8.0", features = [ "net", "os-poll" ] }
-
-lru = "0.8.0"
-
-# Optional for better channels.
-crossbeam-channel = { version = "0.5.0", optional = true }
-
-[dev-dependencies]
-fern = "0.5"
-chrono = "0.4.9"
-
+#TODO(stevenroose) try remove
+miniserde = { version = "0.1.30", optional = true }
